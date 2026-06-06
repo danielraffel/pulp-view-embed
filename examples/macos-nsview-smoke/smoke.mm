@@ -243,6 +243,29 @@ int main(int argc, const char* argv[]) {
         }
         check(ok == 100, "100/100 create+attach+destroy cycles clean");
 
+        // ── M1.6: CPU backend runs (GPU is the goal; CPU must still work) ──
+        std::printf("-- M1.6 CPU backend --\n");
+        PulpEmbedView* cv = create_from(figma, PULP_EMBED_BACKEND_PREF_CPU, 1000, 600);
+        check(cv != nullptr, "create(CPU pref) succeeds");
+        if (cv) {
+            check(pulp_embed_active_backend(cv) == PULP_EMBED_BACKEND_CPU,
+                  "active backend is CPU when CPU requested");
+            NSWindow* cwin = make_offscreen_window(1000, 600);
+            check(pulp_embed_attach(cv, (__bridge void*)cwin.contentView) == PULP_EMBED_OK,
+                  "CPU attach -> OK");
+            check(pulp_embed_resize(cv, 1000, 600, 1.0f) == PULP_EMBED_OK, "CPU resize OK");
+            check(pulp_embed_tick(cv) == PULP_EMBED_OK, "CPU tick OK");
+            // CPU CoreGraphics host has no back-buffer readback: capture is
+            // UNSUPPORTED, but the deterministic Skia render still works.
+            size_t cneed = 0;
+            check(pulp_embed_capture_png(cv, nullptr, 0, &cneed) == PULP_EMBED_ERR_UNSUPPORTED,
+                  "CPU live capture -> UNSUPPORTED (no readback)");
+            auto cpng = render_to(cv, 1000, 600, "/tmp/pulp-embed-cpu-render.png");
+            check(looks_nonblank(cpng, 1000, 600), "CPU deterministic render is non-blank");
+            [cwin close];
+            pulp_embed_destroy(cv);
+        }
+
         std::printf("== %d failure(s) ==\n", g_failures);
         return g_failures == 0 ? 0 : 1;
     }
