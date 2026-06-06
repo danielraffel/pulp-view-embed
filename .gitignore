@@ -1,0 +1,5 @@
+build/
+*.o
+*.a
+*.dylib
+.DS_Store

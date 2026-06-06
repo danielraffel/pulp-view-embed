@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "source": "synthetic",
+  "sourceFile": "fixtures/synthetic/design.ir.json",
+  "imported_at": "2026-06-06T00:00:00Z",
+  "root": {
+    "type": "frame",
+    "name": "SyntheticRoot",
+    "style": {
+      "backgroundColor": "#1e1e22",
+      "width": 320,
+      "height": 200
+    },
+    "layout": {
+      "direction": "column",
+      "gap": 12,
+      "paddingTop": 16,
+      "paddingRight": 16,
+      "paddingBottom": 16,
+      "paddingLeft": 16,
+      "justify": "flex-start",
+      "align": "stretch",
+      "wrap": false,
+      "widthMode": "fixed",
+      "heightMode": "fixed"
+    },
+    "children": [
+      {
+        "type": "rectangle",
+        "name": "Card",
+        "style": {
+          "backgroundColor": "#2b2b31",
+          "borderRadius": 8,
+          "width": 288,
+          "height": 96
+        }
+      },
+      {
+        "type": "text",
+        "name": "Label",
+        "content": "Pulp Embed",
+        "style": {
+          "color": "#e6e6ea",
+          "fontSize": 18,
+          "width": 288,
+          "height": 24
+        }
+      }
+    ]
+  },
+  "tokens": { "colors": {}, "dimensions": {}, "strings": {} },
+  "assetManifest": { "version": 1, "assets": [] },
+  "diagnostics": []
+}
