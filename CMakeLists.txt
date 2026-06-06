@@ -42,4 +42,11 @@ if(APPLE)
     target_compile_definitions(pulp-embed-smoke-mac PRIVATE
         PULP_EMBED_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     add_test(NAME embed-smoke COMMAND pulp-embed-smoke-mac)
+
+    # Standalone fidelity harness (not a ctest gate): render an importer JS
+    # bundle through the high-fidelity scripted-UI path to a PNG for pixel
+    # comparison against the importer's own --validate render.
+    add_executable(pulp-embed-bundle-render examples/macos-nsview-smoke/bundle_render.mm)
+    target_link_libraries(pulp-embed-bundle-render PRIVATE
+        pulp_view_embed "-framework AppKit")
 endif()

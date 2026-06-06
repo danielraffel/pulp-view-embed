@@ -118,6 +118,25 @@ PulpEmbedResult pulp_embed_create_from_design_json_str(const PulpEmbedDesc* desc
                                                        size_t json_len,
                                                        PulpEmbedView** out_view);
 
+/* Build the embedded view from a Pulp importer JS bundle directory — the
+ * `--emit js` output of `pulp import-design` (a `ui.js` driving the native
+ * widget bridge: createCol/createImage/createKnob + setImageSource/setFlex,
+ * with the rasterized assets referenced by absolute or bundle-relative path).
+ *
+ * This is the HIGH-FIDELITY path: it renders through the SAME scripted-UI
+ * pipeline (`pulp::view::ScriptedUiSession` + WidgetBridge) that the Pulp
+ * importer's own `--validate` render and real GPU-scripted plugins use, so the
+ * embed reproduces the importer's render (rasterized 3D shapes, skeuomorphic
+ * knobs, light glass panels) instead of the flattened native-widget fallback.
+ *
+ * `bundle_dir` must contain `ui.js`. Asset paths inside `ui.js` may be absolute
+ * (as emitted by the CLI) or relative to `bundle_dir`. On PULP_EMBED_OK,
+ * *out_view receives the handle; otherwise *out_view is NULL and
+ * pulp_embed_last_create_error() carries detail. */
+PulpEmbedResult pulp_embed_create_from_ui_bundle(const PulpEmbedDesc* desc,
+                                                 const char* bundle_dir,
+                                                 PulpEmbedView** out_view);
+
 /* Copy the most recent creation error on THIS thread into buf (NUL-terminated,
  * truncated to cap). Returns the full length excluding the NUL. Thread-local:
  * read it immediately after a failed create on the same thread. */

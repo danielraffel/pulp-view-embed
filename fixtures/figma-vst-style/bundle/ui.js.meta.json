@@ -1,0 +1,5 @@
+{
+  "canvas": { "width": 1000, "height": 600 },
+  "source": "Figma plugin export",
+  "script": "ui.js"
+}

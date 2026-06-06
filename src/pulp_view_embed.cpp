@@ -19,6 +19,8 @@
 #include <pulp/view/design_ir.hpp>
 #include <pulp/view/plugin_view_host.hpp>
 #include <pulp/view/screenshot.hpp>
+#include <pulp/view/scripted_ui.hpp>
+#include <pulp/view/theme.hpp>
 #include <pulp/view/view.hpp>
 
 #include <exception>
@@ -69,11 +71,177 @@ private:
     pulp::format::ViewSize size_;
 };
 
+// High-fidelity processor: renders an importer JS bundle (`ui.js`) through the
+// SAME scripted-UI pipeline (ScriptedUiSession + WidgetBridge) the Pulp
+// importer's own --validate render and real GPU-scripted plugins use. The
+// scripted path drives the native widget bridge (createCol/createImage/
+// createKnob + setImageSource) and composites the rasterized assets, so the
+// embed reproduces the importer render instead of the flattened native-widget
+// fallback that build_native_view_tree produces.
+//
+// Ownership/lifetime: this processor owns the root View and the
+// ScriptedUiSession (which holds `View&`). create_view() hands the root to the
+// ViewBridge by transferring the unique_ptr — the View object is unmoved, so
+// the session's reference stays valid. active_scripted_ui() lets ViewBridge
+// (and the shim's GPU-surface handoff) reach the session.
+class EmbedScriptedProcessor final : public pulp::format::Processor {
+public:
+    EmbedScriptedProcessor(std::filesystem::path script_path,
+                           std::filesystem::path bundle_dir,
+                           pulp::format::ViewSize size)
+        : script_path_(std::move(script_path)),
+          bundle_dir_(std::move(bundle_dir)),
+          size_(size) {}
+
+    ~EmbedScriptedProcessor() override {
+        // Drop the resolved-script temp file if we wrote one.
+        if (!effective_script_.empty() && effective_script_ != script_path_) {
+            std::error_code ec;
+            std::filesystem::remove(effective_script_, ec);
+        }
+    }
+
+    pulp::format::PluginDescriptor descriptor() const override {
+        pulp::format::PluginDescriptor d;
+        d.name = "PulpEmbed";
+        d.manufacturer = "Pulp";
+        d.bundle_id = "dev.pulp.embed";
+        d.version = "0.1.0";
+        return d;
+    }
+    void define_parameters(pulp::state::StateStore&) override {}
+    void prepare(const pulp::format::PrepareContext&) override {}
+    void process(pulp::audio::BufferView<float>&,
+                 const pulp::audio::BufferView<const float>&,
+                 pulp::midi::MidiBuffer&,
+                 pulp::midi::MidiBuffer&,
+                 const pulp::format::ProcessContext&) override {}
+
+    pulp::format::ViewSize view_size() const override { return size_; }
+
+    // Build the root + scripted session and load the bundle. Throws on load
+    // failure so the create path reports a precise error.
+    void load_or_throw() {
+        root_ = std::make_unique<pulp::view::View>();
+        root_->set_theme(pulp::view::Theme::dark());
+        root_->flex().direction = pulp::view::FlexDirection::column;
+        // Tag the root so the host auto-selects the GPU PluginViewHost — the
+        // scripted UI paints through the Skia/Dawn pipeline. Mirrors
+        // pulp::format::build_editor_ui().
+        root_->set_requires_gpu_host(true);
+        // Give the root the design bounds before the script runs so any
+        // position:absolute + inset:0 chain resolves against a real size
+        // (pulp #1899). The shim re-applies bounds before each render too.
+        root_->set_bounds({0.0f, 0.0f,
+                           static_cast<float>(size_.preferred_width),
+                           static_cast<float>(size_.preferred_height)});
+
+        // Portable bundles may reference assets by path relative to the bundle
+        // dir (e.g. `assets/foo.png`). setImageSource / setKnobSpriteStrip load
+        // a path verbatim (absolute, or relative to CWD), so without help a
+        // relative bundle would only render its images when run from the bundle
+        // dir. Prepend a tiny JS shim that resolves relative asset paths against
+        // the bundle dir before the original setters run. Absolute paths (the
+        // CLI's default `--emit js` output) pass through untouched, so this is a
+        // no-op for those. The combined script is written next to ui.js as a
+        // temp file and removed in the destructor.
+        effective_script_ = build_effective_script();
+
+        pulp::view::ScriptedUiOptions options;
+        options.script_path = effective_script_;
+        options.enable_hot_reload = false;
+        options.enable_theme_reload = false;
+        session_ = std::make_unique<pulp::view::ScriptedUiSession>(*root_, store_, std::move(options));
+
+        std::string err;
+        if (!session_->load(&err)) {
+            throw std::runtime_error("scripted UI load failed: " + (err.empty() ? "unknown" : err));
+        }
+    }
+
+    std::unique_ptr<pulp::view::View> create_view() override {
+        // ViewBridge::open() calls this once. Transfer the already-built root;
+        // the session keeps its View& valid (the object is not moved).
+        return std::move(root_);
+    }
+
+    pulp::view::ScriptedUiSession* active_scripted_ui() override { return session_.get(); }
+    const pulp::view::ScriptedUiSession* active_scripted_ui() const override { return session_.get(); }
+
+    // Destroy the scripted session (and its WidgetBridge) while the root View
+    // it references is still alive. MUST be called before the ViewBridge closes
+    // (which destroys the root) — the WidgetBridge destructor touches root_,
+    // so destroying it after the View is freed is a use-after-free. The shim's
+    // teardown calls this first; see pulp_embed_destroy().
+    void release_session() { session_.reset(); }
+
+private:
+    // Build the script the session actually loads. When bundle_dir_ is known we
+    // wrap ui.js with a path-resolving preamble so relative `assets/...` paths
+    // load regardless of CWD, written as a temp file beside ui.js. If no rewrite
+    // is needed (no bundle dir, or write fails) we fall back to script_path_.
+    std::filesystem::path build_effective_script() {
+        namespace fs = std::filesystem;
+        if (bundle_dir_.empty()) return script_path_;
+
+        std::ifstream in(script_path_, std::ios::binary);
+        if (!in) return script_path_;
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        const std::string ui = ss.str();
+
+        // JSON-escape the bundle dir for the preamble string literal.
+        std::string base = bundle_dir_.string();
+        std::string esc;
+        esc.reserve(base.size());
+        for (char c : base) {
+            if (c == '\\' || c == '"') esc.push_back('\\');
+            esc.push_back(c);
+        }
+
+        // The preamble wraps the two path-taking setters. A path is treated as
+        // relative when it doesn't start with '/' and has no 'scheme://'. Such
+        // paths are prefixed with the bundle dir; everything else is untouched.
+        std::string preamble =
+            "(function(){\n"
+            "  var __pulpEmbedBase = \"" + esc + "\";\n"
+            "  function __pulpEmbedResolve(p){\n"
+            "    if (typeof p !== 'string' || p.length === 0) return p;\n"
+            "    if (p.charAt(0) === '/' || /^[a-zA-Z]+:\\/\\//.test(p)) return p;\n"
+            "    return __pulpEmbedBase + '/' + p;\n"
+            "  }\n"
+            "  if (typeof setImageSource === 'function'){\n"
+            "    var __sis = setImageSource;\n"
+            "    setImageSource = function(id, p){ return __sis(id, __pulpEmbedResolve(p)); };\n"
+            "  }\n"
+            "  if (typeof setKnobSpriteStrip === 'function'){\n"
+            "    var __sks = setKnobSpriteStrip;\n"
+            "    setKnobSpriteStrip = function(id, p, n, o){ return __sks(id, __pulpEmbedResolve(p), n, o); };\n"
+            "  }\n"
+            "})();\n";
+
+        const fs::path out = bundle_dir_ / ".pulp-embed-run.js";
+        std::ofstream of(out, std::ios::binary | std::ios::trunc);
+        if (!of) return script_path_;
+        of << preamble << ui;
+        of.close();
+        return out;
+    }
+
+    std::filesystem::path script_path_;
+    std::filesystem::path bundle_dir_;
+    std::filesystem::path effective_script_;
+    pulp::format::ViewSize size_;
+    pulp::state::StateStore store_;  // session needs a store for bindings
+    std::unique_ptr<pulp::view::View> root_;
+    std::unique_ptr<pulp::view::ScriptedUiSession> session_;
+};
+
 }  // namespace
 
 // The opaque handle. Field order matters for teardown — see destroy().
 struct PulpEmbedView {
-    std::unique_ptr<EmbedProcessor> processor;
+    std::unique_ptr<pulp::format::Processor> processor;
     std::unique_ptr<pulp::state::StateStore> store;
     std::unique_ptr<pulp::format::ViewBridge> bridge;
     std::unique_ptr<pulp::view::PluginViewHost> host;
@@ -190,6 +358,101 @@ PulpEmbedResult create_from_json(const PulpEmbedDesc* desc,
     return PULP_EMBED_OK;
 }
 
+// Wire the host's live GpuSurface into the scripted-UI session's WidgetBridge
+// and install the per-vsync idle pump. This is the load-bearing handoff for
+// scripted/GPU content: without the surface, the JS-side navigator.gpu /
+// canvas.getContext('webgpu') bridge returns mocks and any JS-rendered/canvas
+// output is black (the threejs-bridge "gpu_surface MUST be passed to
+// WidgetBridge" gotcha). For a native-widget-bridge design (rasterized images
+// + skeuo knobs, no live 3D) the surface is harmless but correct to attach.
+// Idempotent: a null surface (CPU host) is a safe detach.
+void wire_scripted_session_to_host(PulpEmbedView* v) {
+    if (!v || !v->bridge || !v->host) return;
+    auto* scripted = v->bridge->scripted_ui();
+    if (!scripted) return;
+    scripted->attach_gpu_surface(v->host->gpu_surface());
+    // Pump the session's poll() once per display-link tick so timers /
+    // requestAnimationFrame / async results keep running while embedded.
+    v->host->set_idle_callback([scripted]() {
+        std::string err;
+        scripted->poll(&err);
+    });
+}
+
+// Shared create path for the high-fidelity scripted-UI bundle. bundle_dir must
+// contain ui.js; asset paths inside resolve absolute or relative to bundle_dir.
+PulpEmbedResult create_from_bundle(const PulpEmbedDesc* desc,
+                                   const std::string& bundle_dir,
+                                   PulpEmbedView** out_view) {
+    if (out_view) *out_view = nullptr;
+    g_create_error.clear();
+    if (auto r = check_desc(desc); r != PULP_EMBED_OK) {
+        g_create_error = "invalid descriptor";
+        return r;
+    }
+    if (!out_view) return PULP_EMBED_ERR_INVALID_ARG;
+
+    namespace fs = std::filesystem;
+    const fs::path script = fs::path(bundle_dir) / "ui.js";
+    if (!fs::exists(script)) {
+        g_create_error = "bundle missing ui.js: " + script.string();
+        return PULP_EMBED_ERR_PARSE;
+    }
+
+    auto v = std::make_unique<PulpEmbedView>();
+
+    const auto w = static_cast<uint32_t>(desc->logical_width);
+    const auto h = static_cast<uint32_t>(desc->logical_height);
+    v->size_hints = pulp::format::view_size_from_design(w, h);
+
+    auto proc = std::make_unique<EmbedScriptedProcessor>(script, fs::path(bundle_dir), v->size_hints);
+    try {
+        proc->load_or_throw();
+    } catch (const std::exception& e) {
+        g_create_error = std::string("bundle load failed: ") + e.what();
+        return PULP_EMBED_ERR_VIEW_OPEN;
+    }
+    v->processor = std::move(proc);
+    v->store = std::make_unique<pulp::state::StateStore>();
+    v->bridge = std::make_unique<pulp::format::ViewBridge>(*v->processor, *v->store);
+
+    std::string err;
+    if (!v->bridge->open(&err)) {
+        g_create_error = "view open failed: " + err;
+        return PULP_EMBED_ERR_VIEW_OPEN;
+    }
+    if (!v->bridge->view()) {
+        g_create_error = "scripted view tree is empty";
+        return PULP_EMBED_ERR_MATERIALIZE;
+    }
+
+    if (auto* rv = v->bridge->view()) {
+        rv->set_bounds({0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h)});
+        rv->layout_children();
+    }
+
+    pulp::view::PluginViewHost::Options opts;
+    opts.size = {w, h};
+    opts.use_gpu = (desc->backend_pref != PULP_EMBED_BACKEND_PREF_CPU);
+    v->host = pulp::view::PluginViewHost::create(*v->bridge->view(), opts);
+    if (!v->host) {
+        g_create_error = "no PluginViewHost (missing platform factory?)";
+        return PULP_EMBED_ERR_HOST_CREATE;
+    }
+    v->backend = v->host->is_gpu_backed() ? PULP_EMBED_BACKEND_GPU : PULP_EMBED_BACKEND_CPU;
+
+    // Load-bearing for scripted/GPU fidelity — see wire_scripted_session_to_host.
+    wire_scripted_session_to_host(v.get());
+
+    if (desc->design_width > 0 && desc->design_height > 0) {
+        v->host->set_design_viewport(static_cast<float>(desc->design_width),
+                                     static_cast<float>(desc->design_height));
+    }
+
+    *out_view = v.release();
+    return PULP_EMBED_OK;
+}
+
 }  // namespace
 
 extern "C" {
@@ -228,6 +491,22 @@ PulpEmbedResult pulp_embed_create_from_design_json_str(const PulpEmbedDesc* desc
         const std::string base_dir =
             (desc && desc->asset_base_path) ? std::string(desc->asset_base_path) : std::string();
         return create_from_json(desc, std::string(json, json_len), base_dir, out_view);
+    } catch (const std::exception& e) {
+        g_create_error = std::string("internal: ") + e.what();
+        return PULP_EMBED_ERR_INTERNAL;
+    } catch (...) {
+        g_create_error = "internal: unknown exception";
+        return PULP_EMBED_ERR_INTERNAL;
+    }
+}
+
+PulpEmbedResult pulp_embed_create_from_ui_bundle(const PulpEmbedDesc* desc,
+                                                 const char* bundle_dir,
+                                                 PulpEmbedView** out_view) {
+    try {
+        if (out_view) *out_view = nullptr;
+        if (!bundle_dir) { g_create_error = "null bundle_dir"; return PULP_EMBED_ERR_INVALID_ARG; }
+        return create_from_bundle(desc, std::string(bundle_dir), out_view);
     } catch (const std::exception& e) {
         g_create_error = std::string("internal: ") + e.what();
         return PULP_EMBED_ERR_INTERNAL;
@@ -411,6 +690,14 @@ void pulp_embed_destroy(PulpEmbedView* v) {
             v->host->set_resize_callback(nullptr);
             v->host->detach();
             v->host.reset();
+        }
+        // For the high-fidelity scripted path the processor owns the
+        // ScriptedUiSession (+ its WidgetBridge), which holds a View& into the
+        // bridge-owned root. Destroy that session BEFORE the bridge frees the
+        // root, or the WidgetBridge destructor touches freed memory. The
+        // DesignIR/native path has no session and this is a no-op.
+        if (auto* sp = dynamic_cast<EmbedScriptedProcessor*>(v->processor.get())) {
+            sp->release_session();
         }
         if (v->bridge) { v->bridge->close(); v->bridge.reset(); }
         v->processor.reset();

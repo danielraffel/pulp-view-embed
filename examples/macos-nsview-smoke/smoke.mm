@@ -266,6 +266,47 @@ int main(int argc, const char* argv[]) {
             pulp_embed_destroy(cv);
         }
 
+        // ── M1.7: high-fidelity scripted-UI bundle path ──────────────────
+        // create_from_ui_bundle renders the importer's `--emit js` output
+        // through the SAME scripted-UI pipeline the importer's own --validate
+        // render uses, so the embed reproduces the importer render (rasterized
+        // 3D shapes, skeuo knobs, light glass panels) instead of the flattened
+        // native-widget fallback. The fixture bundle uses bundle-RELATIVE asset
+        // paths to prove the loader's relative-path resolution.
+        std::printf("-- M1.7 hi-fi scripted bundle --\n");
+        const std::string bundle = fx + "/figma-vst-style/bundle";
+        {
+            PulpEmbedDesc bd = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+            PulpEmbedView* bv = nullptr;
+            PulpEmbedResult br = pulp_embed_create_from_ui_bundle(&bd, bundle.c_str(), &bv);
+            if (br != PULP_EMBED_OK) {
+                char buf[512];
+                pulp_embed_last_create_error(buf, sizeof(buf));
+                std::printf("    create_from_ui_bundle failed: result=%d err=%s\n", br, buf);
+            }
+            check(br == PULP_EMBED_OK && bv != nullptr, "create_from_ui_bundle succeeds");
+            if (bv) {
+                NSWindow* bwin = make_offscreen_window(1000, 600);
+                check(pulp_embed_attach(bv, (__bridge void*)bwin.contentView) == PULP_EMBED_OK,
+                      "bundle attach OK");
+                pump(15);
+                // Deterministic render: a faithful scripted render of this
+                // asset-rich design carries far more entropy than the sparse
+                // native fallback (M1.4 lands ~0.07 B/px). The scripted render
+                // with all rasterized images is well above 0.10 B/px.
+                auto bpng = render_to(bv, 1000, 600, "/tmp/embed-fidelity.png");
+                check(!bpng.empty(), "bundle render_png non-empty");
+                check(looks_nonblank(bpng, 1000, 600), "bundle render is non-blank");
+                const double bpp = bpng.empty() ? 0.0
+                    : static_cast<double>(bpng.size()) / (1000.0 * 600.0);
+                std::printf("    bundle render entropy: %.3f B/px\n", bpp);
+                check(bpp > 0.10,
+                      "bundle render carries rasterized content (>0.10 B/px)");
+                [bwin close];
+                pulp_embed_destroy(bv);
+            }
+        }
+
         std::printf("== %d failure(s) ==\n", g_failures);
         return g_failures == 0 ? 0 : 1;
     }
