@@ -93,6 +93,83 @@ The committed `fixtures/figma-vst-style/bundle/ui.js` uses this relative form;
 the `embed-smoke` ctest reads the first `setImageSource` path as bundle-relative,
 so a freshly imported bundle must be portabilized before it round-trips.
 
+## What you actually get (plain-English FAQ)
+
+**What is embedded?** A single rendered child view — the imported design,
+drawn by Pulp — parented inside your host's window. Your host code talks to it
+only through the flat C header `pulp_view_embed.h` (opaque handle + POD structs
++ result codes). You attach it, size it, tick it, and (ABI v3) bind its controls
+to your host parameters. That's the whole surface.
+
+**Does it pull in Skia/Dawn, or just C++?** It links the **installed Pulp SDK
+statically**, and the SDK brings **Skia (2D GPU rasterizer)** and **Dawn
+(WebGPU)** with it transitively (via `Pulp::render`). So your plugin/app binary
+grows by the Pulp SDK + Skia + Dawn (tens of MB). You do *not* add Skia/Dawn to
+your own build files — `find_package(pulp_view_embed CONFIG)` pulls them in
+behind the C ABI. None of those C++ types leak into your translation units; you
+include one C header.
+
+**GPU or CPU?** GPU is the goal and the default when available: Dawn (Metal on
+macOS) + Skia Graphite render the view, and the host composites Pulp's
+layer-hosting Metal view. If the GPU/Skia stack isn't present, it falls back to
+a CPU raster path (macOS CoreGraphics) — correct, just no GPU effects and some
+image-compositing limits. Both standalone demos run on GPU; the captures in the
+adapter repos are live GPU back-buffer reads.
+
+**Is there a JavaScript engine in my binary?** Only on the **high-fidelity
+path**. `pulp_embed_create_from_ui_bundle` runs the importer's `--emit js`
+bundle through Pulp's scripted-UI pipeline, which uses Pulp's bundled JS engine
+(QuickJS by default) — that's what makes it pixel-identical to the importer.
+The **DesignIR path** (`pulp_embed_create_from_design_json`) builds native
+Pulp widgets with **no JS engine** — lighter, but it drops rasterized images
+and fancy effects. Pick per the "Two render paths" table above.
+
+**What parts of Pulp end up in my code?** Functionally: the view/layout engine
+(Yoga flex+grid), the canvas + text shaping, the render stack (Skia/Dawn), and —
+on the high-fi path — the JS scripted-UI runtime. All static, all behind the C
+ABI. Your source only ever sees `pulp_view_embed.h`.
+
+**How do I change the UX later?** You don't edit C++. You re-run the importer on
+an updated design (or hand-edit the emitted `ui.js` / DesignIR JSON) and ship the
+new bundle — the embed renders whatever bundle you point it at. To make controls
+*do* things, bind them to your host parameters by string key through the ABI v3
+param bridge (a dragged knob writes your param; host automation pushes values
+back). This is the big difference from hand-coding a JUCE/iPlug editor: the
+visual design lives in the bundle, not in your C++.
+
+## Supported design imports + roadmap
+
+The embed is **source-agnostic**: it consumes the Pulp importer's *output*
+(`--emit ir-json` or `--emit js`), not the design tool directly. So anything
+`pulp import-design` can import, the embed can render. Today the importer
+supports:
+
+| Source | `--from` | Through the embed? |
+|---|---|---|
+| Figma (plugin export / REST) | `figma-plugin`, `figma` | ✅ yes (the bundled fixture is a real Figma frame) |
+| Claude Design (manual HTML export) | `claude` | ✅ yes — `--emit js` → high-fi bundle |
+| Stitch | `stitch` | ✅ yes |
+| v0 | `v0` | ✅ yes |
+| Pencil | `pencil` | ✅ yes |
+| React Native | `react-native` | ✅ yes |
+| design.md / JSX runtime | `designmd`, `jsx` | ✅ yes (jsx is experimental) |
+
+What is **not** supported is anything the importer itself can't represent —
+Pulp's layout engine is **flex + grid only** (Yoga / React-Native parity), so
+designs that depend on CSS block flow, floats, tables, multi-column, or print
+pagination are out of scope **by design**, not a missing feature (see Pulp's
+`docs/reference/layout-model.md`). Fidelity also tracks the importer: the
+high-fi path matches the importer's own render exactly, so any remaining gap
+(e.g. a specific knob style) is an importer-workstream item, not an embed
+limitation.
+
+**Roadmap:** the source list above is already the importer's; new sources land
+in `pulp import-design` upstream and the embed picks them up for free (no embed
+change needed). Embed-specific roadmap items are Windows/Linux host parity
+(host code is in; Windows compile-verify pending), `pulp add`-style packaged
+distribution, and zero-copy GPU compositing (the offscreen path currently does
+a CPU RGBA readback).
+
 ## What works (v1, macOS)
 
 - Both create paths above → open a `ViewBridge` → create a `PluginViewHost` (GPU
