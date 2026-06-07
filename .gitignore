@@ -4,3 +4,4 @@ build-shared/
 *.a
 *.dylib
 .DS_Store
+build-v2/
