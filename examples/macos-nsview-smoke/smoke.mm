@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,6 +23,25 @@
 namespace {
 
 int g_failures = 0;
+
+// Diagnostic / hosted-CI override. When PULP_EMBED_CI_NO_GPU is set (e.g. on a
+// GitHub-hosted macOS runner with no window server / Metal adapter), force the
+// CPU backend so the run is deterministic and the GPU-only asserts are not even
+// attempted. The smoke ALREADY degrades naturally — every GPU assert is gated
+// on active_backend == GPU — so this flag is purely a force-headless knob for a
+// reproducible hosted run, not the source of truth. The full-fidelity GPU lane
+// (Pulp's Tart VM, where Apple Virtualization exposes Metal headless) runs
+// WITHOUT this flag and exercises the real GPU attach + capture path.
+bool force_no_gpu() {
+    const char* e = std::getenv("PULP_EMBED_CI_NO_GPU");
+    return e && *e && std::string(e) != "0";
+}
+
+PulpEmbedBackendPref resolve_pref(PulpEmbedBackendPref wanted) {
+    if (force_no_gpu() && wanted == PULP_EMBED_BACKEND_PREF_AUTO)
+        return PULP_EMBED_BACKEND_PREF_CPU;
+    return wanted;
+}
 
 void check(bool cond, const char* what) {
     std::printf("  [%s] %s\n", cond ? "PASS" : "FAIL", what);
@@ -43,7 +63,7 @@ PulpEmbedDesc make_desc(int w, int h, PulpEmbedBackendPref pref) {
     d.logical_width = w;
     d.logical_height = h;
     d.scale_factor = 1.0f;
-    d.backend_pref = pref;
+    d.backend_pref = resolve_pref(pref);
     // Pin the design viewport to the imported design size so the fixed-size
     // tree gets aspect-correct bounds + paint scale (the documented imported-
     // design host gotcha) instead of rendering at native size off-surface.
@@ -265,6 +285,9 @@ int main(int argc, const char* argv[]) {
         const std::string figma = fx + "/figma-vst-style/design.ir.json";
 
         std::printf("== pulp_view_embed smoke (ABI v%u) ==\n", pulp_embed_abi_version());
+        if (force_no_gpu())
+            std::printf("   [PULP_EMBED_CI_NO_GPU] forcing CPU backend; GPU "
+                        "attach/capture asserts will soft-skip (hosted-runner mode)\n");
         check(pulp_embed_abi_version() == PULP_VIEW_EMBED_ABI_VERSION, "abi_version matches header");
 
         // ── M1.1: create synthetic, detached tree ────────────────────────
