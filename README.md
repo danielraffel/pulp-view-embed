@@ -32,6 +32,12 @@ linking Pulp's C++ ABI.
   shared-library + tarball **packaging** story (`DISTRIBUTING.md`).
 - Deterministic headless Skia render (`render_png` / `render_frame_rgba`) +
   live GPU back-buffer capture (`capture_png`).
+- **Faithful-vector native render (v2):** a `faithful_svg` DesignIR renders the
+  frame's own SVG with native SVG-patch knobs (no JS engine) + native overlay
+  controls (dropdown / tab group / stepper / text field).
+- **Dev hot-reload (v2):** `PULP_EMBED_HOT_RELOAD=1` live-reloads the bundle while
+  a host editor is open — edit `ui.js`, save, see it (values preserved). Off by
+  default. See **[Editing & hot-reload](#editing--hot-reload-the-dev-loop--no-re-import-per-tweak)**.
 - Smoke gates M1.1–M1.11 (create/attach/teardown stress, hi-fi bundle, param
   bridge, resolve_resource, offscreen, and a resize/scale/DPI stress sweep).
 
@@ -100,16 +106,26 @@ day-to-day tweaking the design is just **data on disk** (the bundle's `ui.js` +
 `assets/`, or the DesignIR JSON), so you edit that and reload — you do not touch
 C++.
 
-**Live hot-reload while a host editor is open** (opt-in, off by default so it
-never ships in a release build):
+### Live hot-reload while a host editor is open
 
-```bash
-# launch your JUCE/iPlug2 host (or the standalone) with dev hot-reload on:
-PULP_EMBED_HOT_RELOAD=1 open "Pulp Embed (JUCE).app"
-# then edit the bundle's ui.js and save — the open editor reloads live,
-# preserving widget values (Pulp's ScriptedUiSession HotReloader, pumped by the
-# embed's per-tick poll()). theme.json edits reload too.
-```
+Opt-in, **off by default** so it never ships in a release build. How to use:
+
+1. **Launch the host with the dev flag set.** Any host that embeds via this ABI
+   (JUCE/iPlug2 plugin, the standalone, your own app):
+   ```bash
+   PULP_EMBED_HOT_RELOAD=1 open "Pulp Embed (JUCE).app"
+   # or for a plugin, set it in the environment the DAW inherits, or:
+   #   PULP_EMBED_HOT_RELOAD=1 /Applications/REAPER.app/Contents/MacOS/REAPER
+   ```
+2. **Open the plugin/app editor** so the embedded design is on screen.
+3. **Edit the bundle's `ui.js`** (or `theme.json`) in your editor and **save**.
+4. The open editor **reloads live within a frame or two, preserving widget
+   values** — no DAW reload, no re-import, no recompile.
+
+Under the hood: the flag flips on Pulp's `ScriptedUiSession` `HotReloader` (a
+background file watcher whose reload is applied on the UI thread via the
+`poll()` the embed already pumps every display-link tick). Turning the flag off
+(the default) uses the plain load path with no watcher thread.
 
 Notes:
 - Dev hot-reload loads the bundle's `ui.js` **directly** (so the file watcher
