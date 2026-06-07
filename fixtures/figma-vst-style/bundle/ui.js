@@ -542,7 +542,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
             setFlex('Frame_48746', 'align_items', 'center');
 
               // @pulp-anchor 1v61mry
-              // VALUE
+              // Morph
               createCol('Knob_Small47_col', 'Frame_48746');
               setFlex('Knob_Small47_col', 'align_items', 'center');
               setFlex('Knob_Small47_col', 'gap', 4);
@@ -554,7 +554,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
               setLabel('Knob_Small47', ' ');
               setValue('Knob_Small47', 0.5);
               setWidgetStyle('Knob_Small47', 'silver');
-              createLabel('Knob_Small47_lbl', 'VALUE', 'Knob_Small47_col');
+              createLabel('Knob_Small47_lbl', 'Morph', 'Knob_Small47_col');
               setFlex('Knob_Small47_lbl', 'height', 14);
               setFontSize('Knob_Small47_lbl', 11);
               setTextColor('Knob_Small47_lbl', '#a6adc8');
@@ -666,7 +666,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
             setFlex('Frame_48758', 'align_items', 'center');
 
               // @pulp-anchor 1v61mry
-              // VALUE
+              // Reso
               createCol('Knob_Small59_col', 'Frame_48758');
               setFlex('Knob_Small59_col', 'align_items', 'center');
               setFlex('Knob_Small59_col', 'gap', 4);
@@ -678,7 +678,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
               setLabel('Knob_Small59', ' ');
               setValue('Knob_Small59', 0.5);
               setWidgetStyle('Knob_Small59', 'silver');
-              createLabel('Knob_Small59_lbl', 'VALUE', 'Knob_Small59_col');
+              createLabel('Knob_Small59_lbl', 'Reso', 'Knob_Small59_col');
               setFlex('Knob_Small59_lbl', 'height', 14);
               setFontSize('Knob_Small59_lbl', 11);
               setTextColor('Knob_Small59_lbl', '#a6adc8');
@@ -982,7 +982,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
             setFlex('Frame_48786', 'align_items', 'center');
 
               // @pulp-anchor 1v61mry
-              // VALUE
+              // Send
               createCol('Knob_Small87_col', 'Frame_48786');
               setFlex('Knob_Small87_col', 'align_items', 'center');
               setFlex('Knob_Small87_col', 'gap', 4);
@@ -994,7 +994,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
               setLabel('Knob_Small87', ' ');
               setValue('Knob_Small87', 0.5);
               setWidgetStyle('Knob_Small87', 'silver');
-              createLabel('Knob_Small87_lbl', 'VALUE', 'Knob_Small87_col');
+              createLabel('Knob_Small87_lbl', 'Send', 'Knob_Small87_col');
               setFlex('Knob_Small87_lbl', 'height', 14);
               setFontSize('Knob_Small87_lbl', 11);
               setTextColor('Knob_Small87_lbl', '#a6adc8');
@@ -1186,7 +1186,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
           createCol('Knob104_col', 'Frame_38102');
           setFlex('Knob104_col', 'align_items', 'center');
           setFlex('Knob104_col', 'gap', 4);
-          setFlex('Knob104_col', 'height', 111);
+          setFlex('Knob104_col', 'height', 127);
           setFlex('Knob104_col', 'min_width', 62);
           createKnob('Knob104', 'Knob104_col');
           setFlex('Knob104', 'width', 62);
@@ -1199,6 +1199,11 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
           setFontSize('Knob104_lbl', 11);
           setTextColor('Knob104_lbl', '#a6adc8');
           setTextAlign('Knob104_lbl', 'center');
+          createLabel('Knob104_val', '80%', 'Knob104_col');
+          setFlex('Knob104_val', 'height', 12);
+          setFontSize('Knob104_val', 10);
+          setTextColor('Knob104_val', '#6c7086');
+          setTextAlign('Knob104_val', 'center');
 
           // @pulp-anchor zc0u14
           // VALUE
@@ -1279,7 +1284,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
           createCol('Knob110_col', 'Frame_38108');
           setFlex('Knob110_col', 'align_items', 'center');
           setFlex('Knob110_col', 'gap', 4);
-          setFlex('Knob110_col', 'height', 111);
+          setFlex('Knob110_col', 'height', 127);
           setFlex('Knob110_col', 'min_width', 62);
           createKnob('Knob110', 'Knob110_col');
           setFlex('Knob110', 'width', 62);
@@ -1292,6 +1297,11 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
           setFontSize('Knob110_lbl', 11);
           setTextColor('Knob110_lbl', '#a6adc8');
           setTextAlign('Knob110_lbl', 'center');
+          createLabel('Knob110_val', '80%', 'Knob110_col');
+          setFlex('Knob110_val', 'height', 12);
+          setFontSize('Knob110_val', 10);
+          setTextColor('Knob110_val', '#6c7086');
+          setTextAlign('Knob110_val', 'center');
 
           // @pulp-anchor zc0u14
           // VALUE
@@ -1372,7 +1382,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
           createCol('Knob116_col', 'Frame_38114');
           setFlex('Knob116_col', 'align_items', 'center');
           setFlex('Knob116_col', 'gap', 4);
-          setFlex('Knob116_col', 'height', 111);
+          setFlex('Knob116_col', 'height', 127);
           setFlex('Knob116_col', 'min_width', 62);
           createKnob('Knob116', 'Knob116_col');
           setFlex('Knob116', 'width', 62);
@@ -1385,6 +1395,11 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
           setFontSize('Knob116_lbl', 11);
           setTextColor('Knob116_lbl', '#a6adc8');
           setTextAlign('Knob116_lbl', 'center');
+          createLabel('Knob116_val', '80%', 'Knob116_col');
+          setFlex('Knob116_val', 'height', 12);
+          setFontSize('Knob116_val', 10);
+          setTextColor('Knob116_val', '#6c7086');
+          setTextAlign('Knob116_val', 'center');
 
           // @pulp-anchor zc0u14
           // VALUE
@@ -1464,7 +1479,7 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
           createCol('Knob122_col', 'Frame_38120');
           setFlex('Knob122_col', 'align_items', 'center');
           setFlex('Knob122_col', 'gap', 4);
-          setFlex('Knob122_col', 'height', 111);
+          setFlex('Knob122_col', 'height', 127);
           setFlex('Knob122_col', 'min_width', 62);
           createKnob('Knob122', 'Knob122_col');
           setFlex('Knob122', 'width', 62);
@@ -1477,6 +1492,11 @@ setBoxShadow('root', 0, 23, 73, 0, '#506274');
           setFontSize('Knob122_lbl', 11);
           setTextColor('Knob122_lbl', '#a6adc8');
           setTextAlign('Knob122_lbl', 'center');
+          createLabel('Knob122_val', '80%', 'Knob122_col');
+          setFlex('Knob122_val', 'height', 12);
+          setFontSize('Knob122_val', 10);
+          setTextColor('Knob122_val', '#6c7086');
+          setTextAlign('Knob122_val', 'center');
 
           // @pulp-anchor zc0u14
           // VALUE

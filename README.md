@@ -79,6 +79,20 @@ pulp import-design --from figma-plugin --file scene.pulp.json --emit js --output
 pulp_embed_create_from_ui_bundle(&desc, "bundle", &view);   # renders that bundle
 ```
 
+The importer pre-resolves each asset to an **absolute** filesystem path in
+`ui.js` (`setImageSource` / `registerFont` / `setKnobSpriteStrip`). For a
+**portable** bundle that loads against its own dir at runtime, rewrite those to
+the bundle-relative `assets/<file>` form after import (the embed's path-resolver
+preamble resolves the relative form against the bundle dir):
+
+```bash
+perl -0pi -e "s{(['\"])(?:/[^'\"]*?/)?assets/([^'\"]+)\1}{\${1}assets/\${2}\${1}}g" bundle/ui.js
+```
+
+The committed `fixtures/figma-vst-style/bundle/ui.js` uses this relative form;
+the `embed-smoke` ctest reads the first `setImageSource` path as bundle-relative,
+so a freshly imported bundle must be portabilized before it round-trips.
+
 ## What works (v1, macOS)
 
 - Both create paths above → open a `ViewBridge` → create a `PluginViewHost` (GPU
