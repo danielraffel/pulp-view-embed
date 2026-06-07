@@ -41,8 +41,22 @@ extern "C" {
  * pulp_embed_param_changed() functions were added. The desc growth is
  * struct_size-gated, so a v1 caller's smaller desc is still accepted (the new
  * tail reads as zero/NULL = "no host bridge"), and a v2 library accepts a v1
- * desc. abi_version is therefore validated as "<= library version", not "==". */
-#define PULP_VIEW_EMBED_ABI_VERSION 2u
+ * desc. abi_version is therefore validated as "<= library version", not "==".
+ *
+ * v3 (2026-06): two deferred capabilities.
+ *   (1) resolve_resource — a host resource-resolution callback APPENDED to the
+ *       PulpEmbedHostCallbacks block. The shim consults it for each design asset
+ *       BEFORE disk; bytes it returns are staged so the existing on-disk render
+ *       path picks them up (NULL -> disk fallback). Because the field is at the
+ *       END of the host block, a v2 caller's smaller struct_size simply stops
+ *       before it (read as NULL = "no resource bridge"); the older host
+ *       callbacks are still captured field-by-field.
+ *   (2) offscreen/texture render mode — pulp_embed_create_offscreen() (no parent
+ *       window) + pulp_embed_render_frame_rgba() (CPU-readable RGBA of the latest
+ *       frame). These are new functions, not desc-layout changes.
+ * The desc layout grows (host block gains resolve_resource), so this is a real
+ * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
+#define PULP_VIEW_EMBED_ABI_VERSION 3u
 
 /* Opaque embedded-view handle. */
 typedef struct PulpEmbedView PulpEmbedView;
@@ -106,12 +120,35 @@ typedef double (*PulpEmbedGetParamFn)(void* host_ctx, const char* key);
 typedef void   (*PulpEmbedGestureFn)(void* host_ctx, const char* key);
 typedef int32_t (*PulpEmbedReadMetersFn)(void* host_ctx, float* out, int32_t cap);
 
+/* Host resource-resolution callback (ABI v3).
+ *
+ * The host serves an imported asset's bytes by id, so a design's images/fonts
+ * can come from the host (an in-memory asset store, an encrypted bundle, a
+ * project file) instead of disk. `id` is the design's asset identifier:
+ *   - bundle path (pulp_embed_create_from_ui_bundle): the asset path as written
+ *     in ui.js, e.g. "assets/<hash>.png".
+ *   - DesignIR path (pulp_embed_create_from_design_json[_str]): the manifest
+ *     asset's local_path (its on-disk-relative path), e.g. "assets/<hash>.png".
+ *
+ * Return BORROWED bytes valid until creation returns, and write the byte count
+ * to *out_len. Return NULL (and the shim falls back to loading `id` from disk).
+ * The shim copies any returned bytes immediately (it stages them to a temp file
+ * the existing on-disk render path reads), so the host may free/recycle its
+ * buffer as soon as the callback returns. Called once per asset, during
+ * creation, on the host thread. NULL slot = no resource bridge (disk only). */
+typedef const uint8_t* (*PulpEmbedResolveResourceFn)(void* host_ctx,
+                                                     const char* id,
+                                                     size_t* out_len);
+
 typedef struct PulpEmbedHostCallbacks {
     PulpEmbedSetParamFn   set_param;     /* UI gesture -> host param write      */
     PulpEmbedGetParamFn   get_param;     /* host -> view initial-value pull     */
     PulpEmbedGestureFn    begin_gesture; /* UI gesture begin (undo grouping)    */
     PulpEmbedGestureFn    end_gesture;   /* UI gesture end                      */
     PulpEmbedReadMetersFn read_meters;   /* polled from tick(); may be NULL     */
+    /* ABI v3 tail — struct_size-gated. A v1/v2 caller's smaller desc stops
+     * before this; the shim reads it as NULL = "no resource bridge". */
+    PulpEmbedResolveResourceFn resolve_resource; /* host asset bytes by id      */
 } PulpEmbedHostCallbacks;
 
 /* Creation descriptor. Zero-initialize, then set struct_size = sizeof(*desc),
@@ -187,6 +224,51 @@ PulpEmbedResult pulp_embed_create_from_design_json_str(const PulpEmbedDesc* desc
 PulpEmbedResult pulp_embed_create_from_ui_bundle(const PulpEmbedDesc* desc,
                                                  const char* bundle_dir,
                                                  PulpEmbedView** out_view);
+
+/* ---- offscreen / texture render mode (ABI v3) ------------------------- *
+ *
+ * For a host that composites Pulp's output ITSELF — no Pulp-owned child NSView.
+ * The view is built exactly like the windowed create paths (same materializer /
+ * scripted-UI pipeline, same parameter bridge, same resolve_resource staging),
+ * but is never attached to a parent and never drives a display-link. The host
+ * pulls finished frames on demand with pulp_embed_render_frame_rgba() and draws
+ * them into its own surface.
+ *
+ * `source` is a DesignIR JSON file path when from_bundle == 0, or a bundle
+ * directory (containing ui.js) when from_bundle != 0 — the offscreen analogues
+ * of pulp_embed_create_from_design_json and pulp_embed_create_from_ui_bundle.
+ * On PULP_EMBED_OK, *out_view receives the handle; otherwise *out_view is NULL
+ * and pulp_embed_last_create_error() carries detail.
+ *
+ * The frame producer is Pulp's deterministic headless Skia renderer (the same
+ * one behind pulp_embed_render_png), so offscreen output matches the windowed
+ * embed's high-fidelity render. An offscreen view reports
+ * PULP_EMBED_BACKEND_CPU from pulp_embed_active_backend (no live GPU host), but
+ * still renders the full scripted UI. */
+PulpEmbedResult pulp_embed_create_offscreen(const PulpEmbedDesc* desc,
+                                            const char* source,
+                                            int32_t from_bundle,
+                                            PulpEmbedView** out_view);
+
+/* Render the current view tree to a CPU-readable RGBA frame and copy it into
+ * `out` (capacity `cap` bytes). The pixel format is tightly packed RGBA8
+ * (R,G,B,A byte order), premultiplied alpha, sRGB, top-to-bottom rows, with
+ * stride == *w * 4. Pixel dimensions are width*scale by height*scale; they are
+ * always written to *w / *h (and *stride to the row byte count) so the caller
+ * can size its buffer exactly.
+ *
+ * Two-call sizing pattern: pass out=NULL to learn *w/*h/*stride and the required
+ * byte count (returned via *stride * *h; check against your buffer), then call
+ * again with cap >= (*stride * *h). Returns PULP_EMBED_ERR_BUFFER_TOO_SMALL if
+ * out != NULL but cap < required, and PULP_EMBED_ERR_UNSUPPORTED when no Skia
+ * raster backend is available. Works for BOTH offscreen and windowed views (it
+ * renders deterministically; it does not read a live back buffer — use
+ * pulp_embed_capture_png for the live host surface). */
+PulpEmbedResult pulp_embed_render_frame_rgba(PulpEmbedView* view,
+                                             int32_t width, int32_t height,
+                                             float scale, uint8_t* out,
+                                             size_t cap, int32_t* w,
+                                             int32_t* h, int32_t* stride);
 
 /* Copy the most recent creation error on THIS thread into buf (NUL-terminated,
  * truncated to cap). Returns the full length excluding the NUL. Thread-local:
