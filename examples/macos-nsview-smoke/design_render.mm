@@ -59,7 +59,21 @@ int main(int argc, const char* argv[]) {
             return 1;
         }
         std::printf("active backend: %d\n", pulp_embed_active_backend(v));
-        std::printf("param count: %d\n", pulp_embed_param_count(v));
+        const int pcount = pulp_embed_param_count(v);
+        std::printf("param count: %d\n", pcount);
+
+        // Host->UI binding proof: PULP_EMBED_FORCE_ALL=<0..1> pushes that value
+        // into every bound param via the ABI (pulp_embed_param_changed), so the
+        // render reflects host-driven automation (e.g. all knobs swept).
+        if (const char* fv = std::getenv("PULP_EMBED_FORCE_ALL")) {
+            const double val = std::atof(fv);
+            for (int i = 0; i < pcount; ++i) {
+                char key[256];
+                pulp_embed_param_key(v, i, key, sizeof key);
+                pulp_embed_param_changed(v, key, val);
+            }
+            std::printf("forced %d params to %.3f\n", pcount, val);
+        }
 
         NSRect frame = NSMakeRect(-20000, -20000, w, h);
         NSWindow* win = [[NSWindow alloc]

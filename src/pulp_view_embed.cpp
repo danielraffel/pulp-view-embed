@@ -17,6 +17,7 @@
 #include <pulp/state/listener_token.hpp>
 #include <pulp/state/parameter.hpp>
 #include <pulp/state/store.hpp>
+#include <pulp/view/design_frame_view.hpp>
 #include <pulp/view/design_import.hpp>
 #include <pulp/view/design_ir.hpp>
 #include <pulp/view/plugin_view_host.hpp>
@@ -76,7 +77,35 @@ public:
         return pulp::view::build_native_view_tree(ir_, ir_.asset_manifest, opts);
     }
 
+    // Faithful-vector binding keys for the SVG-patch KNOB elements, in the same
+    // index order make_faithful_svg_frame builds them into the DesignFrameView,
+    // so element index i here maps to DesignFrameView element i. Key is the
+    // source node id (the importer's "binding key"); falls back to a stable
+    // synthetic key when the source carried none. Only knobs (continuous params)
+    // are returned for now — dropdown/tab/stepper are choice controls and
+    // text_field is not a normalized param (in-view interactive either way).
+    std::vector<std::pair<int, std::string>> faithful_knob_keys() const {
+        std::vector<std::pair<int, std::string>> out;
+        const pulp::view::IRNode* frame = find_faithful_node(ir_.root);
+        if (!frame) return out;
+        for (int i = 0; i < static_cast<int>(frame->interactive_elements.size()); ++i) {
+            const auto& e = frame->interactive_elements[static_cast<size_t>(i)];
+            if (e.kind != pulp::view::InteractiveElementKind::knob) continue;
+            std::string key = e.source_node_id.value_or("");
+            if (key.empty()) key = "knob:" + std::to_string(i);
+            out.emplace_back(i, std::move(key));
+        }
+        return out;
+    }
+
 private:
+    static const pulp::view::IRNode* find_faithful_node(const pulp::view::IRNode& n) {
+        if (n.render_mode == pulp::view::NodeRenderMode::faithful_svg) return &n;
+        for (const auto& c : n.children)
+            if (const auto* f = find_faithful_node(c)) return f;
+        return nullptr;
+    }
+
     pulp::view::DesignIR ir_;
     pulp::format::ViewSize size_;
 };
@@ -306,6 +335,14 @@ struct ParamBinding {
     pulp::state::ParamID param_id = 0;
     ParamWidgetKind kind = ParamWidgetKind::knob;
     pulp::view::View* widget = nullptr;  // borrowed; owned by the view tree
+    // Faithful-vector binding (v2): when >= 0, `widget` is the DesignFrameView
+    // and the param drives its element at this index (an SVG-patch knob) via
+    // element_value()/set_element_value() instead of a Knob/Fader/Toggle. The
+    // frame view has no on_change, so UI->host is bridged by polling element_value
+    // each tick (poll_frame_params); `frame_last` is the last value pushed to the
+    // store so the poll doesn't echo a host-driven change back out.
+    int   frame_element_index = -1;
+    float frame_last = -1.0f;
 };
 
 }  // namespace
@@ -383,6 +420,7 @@ void capture_host_callbacks(PulpEmbedView* v, const PulpEmbedDesc* desc) {
 // (next to the host/session wiring) but the create paths above reference them.
 void build_param_bridge(PulpEmbedView* v);
 void poll_host_meters(PulpEmbedView* v);
+void poll_frame_params(PulpEmbedView* v);
 
 // ── host resource staging (resolve_resource, ABI v3) ───────────────────────
 //
@@ -618,29 +656,48 @@ bool classify_bindable(pulp::view::View* w, ParamWidgetKind* out_kind) {
 }
 
 // Read a control's current normalized [0,1] value.
-float widget_normalized(pulp::view::View* w, ParamWidgetKind kind) {
-    switch (kind) {
+float widget_normalized(const ParamBinding& b) {
+    if (b.frame_element_index >= 0) {  // faithful-vector SVG-patch knob
+        float v = static_cast<pulp::view::DesignFrameView*>(b.widget)
+                      ->element_value(b.frame_element_index);
+        return v < 0.0f ? 0.0f : v;    // element_value returns -1 for bad index
+    }
+    switch (b.kind) {
         case ParamWidgetKind::knob:
-            return static_cast<pulp::view::Knob*>(w)->value();
+            return static_cast<pulp::view::Knob*>(b.widget)->value();
         case ParamWidgetKind::fader:
-            return static_cast<pulp::view::Fader*>(w)->value();
+            return static_cast<pulp::view::Fader*>(b.widget)->value();
         case ParamWidgetKind::toggle:
-            return static_cast<pulp::view::Toggle*>(w)->is_on() ? 1.0f : 0.0f;
+            return static_cast<pulp::view::Toggle*>(b.widget)->is_on() ? 1.0f : 0.0f;
     }
     return 0.0f;
 }
 
 // Apply a normalized [0,1] value to a control (programmatic; does NOT fire the
 // widget's on_change — see widgets.cpp set_value / set_on, which only repaint).
-void widget_set_normalized(pulp::view::View* w, ParamWidgetKind kind, float v) {
-    switch (kind) {
-        case ParamWidgetKind::knob:
-            static_cast<pulp::view::Knob*>(w)->set_value(v); break;
-        case ParamWidgetKind::fader:
-            static_cast<pulp::view::Fader*>(w)->set_value(v); break;
-        case ParamWidgetKind::toggle:
-            static_cast<pulp::view::Toggle*>(w)->set_on(v > 0.5f); break;
+void widget_set_normalized(const ParamBinding& b, float v) {
+    if (b.frame_element_index >= 0) {  // faithful-vector SVG-patch knob
+        static_cast<pulp::view::DesignFrameView*>(b.widget)
+            ->set_element_value(b.frame_element_index, v);
+        return;
     }
+    switch (b.kind) {
+        case ParamWidgetKind::knob:
+            static_cast<pulp::view::Knob*>(b.widget)->set_value(v); break;
+        case ParamWidgetKind::fader:
+            static_cast<pulp::view::Fader*>(b.widget)->set_value(v); break;
+        case ParamWidgetKind::toggle:
+            static_cast<pulp::view::Toggle*>(b.widget)->set_on(v > 0.5f); break;
+    }
+}
+
+// First DesignFrameView in the tree (the faithful-vector frame), or nullptr.
+pulp::view::DesignFrameView* find_design_frame_view(pulp::view::View* v) {
+    if (!v) return nullptr;
+    if (auto* f = dynamic_cast<pulp::view::DesignFrameView*>(v)) return f;
+    for (size_t i = 0; i < v->child_count(); ++i)
+        if (auto* f = find_design_frame_view(v->child_at(i))) return f;
+    return nullptr;
 }
 
 // Walk the view tree depth-first, collecting bindable controls in document
@@ -715,6 +772,25 @@ void build_param_bridge(PulpEmbedView* v) {
 
     collect_bindable(root, v->params);
 
+    // Faithful-vector lane (v2): the DesignFrameView's SVG-patch knobs aren't
+    // Knob widgets, so collect_bindable misses them. Append one binding per knob
+    // element, keyed by the importer's source node id, targeting the frame view
+    // by element index. (Choice overlays — dropdown/tab/stepper — and text
+    // fields stay in-view-interactive; host-param binding for those is a follow-up.)
+    if (auto* ep = dynamic_cast<EmbedProcessor*>(v->processor.get())) {
+        if (auto* frame = find_design_frame_view(root)) {
+            for (auto& [idx, key] : ep->faithful_knob_keys()) {
+                ParamBinding b;
+                b.key = key;
+                b.widget_id = key;
+                b.kind = ParamWidgetKind::knob;
+                b.widget = frame;
+                b.frame_element_index = idx;
+                v->params.push_back(std::move(b));
+            }
+        }
+    }
+
     for (size_t i = 0; i < v->params.size(); ++i) {
         auto& b = v->params[i];
         b.param_id = static_cast<pulp::state::ParamID>(i + 1);  // 0 reserved
@@ -728,17 +804,21 @@ void build_param_bridge(PulpEmbedView* v) {
 
         // Seed: prefer the host's current value (automation/preset already set
         // before the editor opened), else the widget's imported default.
-        float seed = widget_normalized(b.widget, b.kind);
+        float seed = widget_normalized(b);
         if (v->host_cb.get_param) {
             double hv = v->host_cb.get_param(v->host_ctx, b.key.c_str());
             if (hv >= 0.0 && hv <= 1.0) {
                 seed = static_cast<float>(hv);
-                widget_set_normalized(b.widget, b.kind, seed);
+                widget_set_normalized(b, seed);
             }
         }
         v->store->set_normalized(b.param_id, seed);
+        b.frame_last = seed;  // baseline so the tick poll doesn't re-forward it
 
-        wire_widget_to_host(v, b);
+        // Frame-element knobs have no on_change; UI->host is bridged in
+        // poll_frame_params() each tick. Other widgets wire their on_change here.
+        if (b.frame_element_index < 0)
+            wire_widget_to_host(v, b);
     }
 
     // Gesture begin/end forwarding (one set of callbacks for the whole store).
@@ -780,6 +860,23 @@ void build_param_bridge(PulpEmbedView* v) {
 // hosts without a read_meters callback make this a no-op. The figma fixture has
 // no meters, so this is currently a forwarding stub kept ready for meter-bearing
 // designs (see report note).
+// Bridge faithful-vector knob drags to the host. DesignFrameView has no
+// on_change, so each tick we diff every frame-element knob's value against the
+// last value we forwarded; on a real change, write it to the store (whose
+// listener forwards to host.set_param). Cheap: only frame-bound params, and only
+// when not mid host-driven apply (which would feed back).
+void poll_frame_params(PulpEmbedView* v) {
+    if (!v || !v->store || v->applying_host_change) return;
+    for (auto& b : v->params) {
+        if (b.frame_element_index < 0) continue;
+        const float now = widget_normalized(b);
+        if (std::abs(now - b.frame_last) > 1e-4f) {
+            b.frame_last = now;
+            v->store->set_normalized(b.param_id, now);  // listener -> host.set_param
+        }
+    }
+}
+
 void poll_host_meters(PulpEmbedView* v) {
     if (!v || !v->host_cb.read_meters) return;
     constexpr int kCap = pulp::view::MeterData::max_channels;
@@ -1102,8 +1199,10 @@ PulpEmbedResult pulp_embed_resize(PulpEmbedView* v, int32_t w, int32_t h, float 
 PulpEmbedResult pulp_embed_tick(PulpEmbedView* v) {
     if (!v || !v->host) return PULP_EMBED_ERR_INVALID_ARG;
     try {
-        // Drain any host param writes queued from the audio thread, then pull
-        // the latest meter levels for designs that have meters.
+        // Forward any faithful-vector knob drags to the host (store write ->
+        // listener), then drain host param writes queued from the audio thread,
+        // then pull the latest meter levels for designs that have meters.
+        poll_frame_params(v);
         if (v->store) v->store->pump_listeners();
         poll_host_meters(v);
         v->host->repaint();
@@ -1243,7 +1342,10 @@ PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* v, const char* key, doub
 
         // Mirror into the live widget (set_value/set_on does not fire on_change,
         // so this stays a one-way host->view push) and repaint.
-        if (b.widget) widget_set_normalized(b.widget, b.kind, val);
+        if (b.widget) widget_set_normalized(b, val);
+        // Keep the frame-knob poll baseline in sync so this host-driven value
+        // is not immediately re-forwarded back to host.set_param next tick.
+        if (b.frame_element_index >= 0) b.frame_last = val;
         if (v->host) v->host->repaint();
         return PULP_EMBED_OK;
     } catch (const std::exception& e) {
