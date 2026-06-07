@@ -1,0 +1,40 @@
+# Exported-symbols list for libpulp_view_embed.dylib (Mach-O / ld64).
+#
+# Pins the shared library's exported surface to exactly the pulp_embed_* C ABI.
+# Without this, the static Pulp/Skia/Abseil/WebP archives linked into the dylib
+# re-export tens of thousands of their own (and pulp::-mangled) symbols, which
+# pollutes the foreign host's global symbol namespace and risks collisions.
+#
+# Mach-O symbol names carry a leading underscore, so every C function
+# `pulp_embed_x` is the symbol `_pulp_embed_x` here. Keep this list in lockstep
+# with the public functions declared in include/pulp_view_embed.h.
+#
+# Passed to the linker via -Wl,-exported_symbols_list. If a new public function
+# is added to the header, add its `_`-prefixed name here or it will not be
+# visible to dlsym / direct linking against the dylib.
+_pulp_embed_abi_version
+_pulp_embed_active_backend
+_pulp_embed_attach
+_pulp_embed_capture_png
+_pulp_embed_create_from_design_json
+_pulp_embed_create_from_design_json_str
+_pulp_embed_create_from_ui_bundle
+_pulp_embed_create_offscreen
+_pulp_embed_destroy
+_pulp_embed_detach
+_pulp_embed_last_create_error
+_pulp_embed_last_error
+_pulp_embed_native_handle
+_pulp_embed_notify_attached
+_pulp_embed_param_changed
+_pulp_embed_param_count
+_pulp_embed_param_key
+_pulp_embed_param_value
+_pulp_embed_param_widget_id
+_pulp_embed_render_frame_rgba
+_pulp_embed_render_png
+_pulp_embed_repaint
+_pulp_embed_resize
+_pulp_embed_simulate_param_drag
+_pulp_embed_size_hints
+_pulp_embed_tick

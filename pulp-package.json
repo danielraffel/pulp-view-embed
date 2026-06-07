@@ -1,0 +1,60 @@
+{
+  "registry_version": 2,
+  "packages": {
+    "pulp-view-embed": {
+      "name": "Pulp View Embed",
+      "version": "0.1.0",
+      "description": "Flat C ABI for embedding a Pulp-imported frontend inside a foreign C++ host (JUCE, iPlug2, bespoke) without linking Pulp's C++ ABI",
+      "license": "MIT",
+      "category": "ui",
+      "url": "https://github.com/danielraffel/pulp-view-embed",
+      "fetch": {
+        "method": "FetchContent",
+        "git_repository": "https://github.com/danielraffel/pulp-view-embed.git",
+        "git_tag": "v0.1.0"
+      },
+      "cmake": {
+        "targets": [
+          "pulp_view_embed"
+        ],
+        "header_only": false,
+        "include_dir": "include"
+      },
+      "platforms": {
+        "macOS": {
+          "architectures": [
+            "arm64",
+            "x86_64"
+          ],
+          "notes": "Source builds require an installed Pulp SDK discoverable via find_package(Pulp CONFIG REQUIRED) (set CMAKE_PREFIX_PATH). Prebuilt distributions ship a pulp_view_embedConfig.cmake so a foreign host can find_package(pulp_view_embed) without any Pulp build."
+        }
+      },
+      "rt_safe": false,
+      "tags": [
+        "ui",
+        "embedding",
+        "foreign-host",
+        "c-abi",
+        "figma",
+        "design-import"
+      ],
+      "provides": [
+        "pulp-frontend-embedding"
+      ],
+      "overlaps_with_builtin": {},
+      "unique_value": "Lets a non-Pulp C/C++ host embed a Pulp-imported frontend (e.g. a Figma design) as a rendered child view through a stable C ABI, with a bidirectional host<->view parameter bridge and an offscreen/texture render mode.",
+      "alternatives": [],
+      "migration_notes": {},
+      "verification": {
+        "last_verified": "2026-06-06",
+        "verified_version": "0.1.0",
+        "upstream_commit": "fb511d7",
+        "upstream_latest": "v0.1.0",
+        "pulp_commit": "0.332.1",
+        "build_status": {
+          "macOS-arm64": "pass"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+@PACKAGE_INIT@
+
+# pulp_view_embedConfig.cmake — find_package(pulp_view_embed CONFIG) support.
+#
+# A foreign host consumes a PREBUILT libpulp_view_embed.dylib through this
+# config. The dylib statically links the Pulp C++ runtime (Skia/Dawn/Abseil/...)
+# and exports ONLY the pulp_embed_* C ABI, so the host needs neither a Pulp SDK
+# nor find_package(Pulp). The only sibling runtime dependency is the bundled
+# libwgpu_native.dylib (the WebGPU backend), which ships in the same lib/ dir
+# and is resolved at runtime via the dylib's @loader_path rpath.
+#
+# Usage:
+#   find_package(pulp_view_embed CONFIG REQUIRED)
+#   target_link_libraries(my_host PRIVATE pulp_view_embed::pulp_view_embed)
+#
+# The imported target carries the include dir (pulp_view_embed.h) and the
+# required Apple frameworks the C ABI transitively needs (AppKit etc. come from
+# the dylib's own load commands; nothing else is required at link time).
+
+include("${CMAKE_CURRENT_LIST_DIR}/pulp_view_embedTargets.cmake")
+
+check_required_components(pulp_view_embed)
