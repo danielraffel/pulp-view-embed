@@ -14,6 +14,8 @@
 
 #include <pulp/format/processor.hpp>
 #include <pulp/format/view_bridge.hpp>
+#include <pulp/state/listener_token.hpp>
+#include <pulp/state/parameter.hpp>
 #include <pulp/state/store.hpp>
 #include <pulp/view/design_import.hpp>
 #include <pulp/view/design_ir.hpp>
@@ -22,13 +24,17 @@
 #include <pulp/view/scripted_ui.hpp>
 #include <pulp/view/theme.hpp>
 #include <pulp/view/view.hpp>
+#include <pulp/view/widgets.hpp>
 
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -237,6 +243,24 @@ private:
     std::unique_ptr<pulp::view::ScriptedUiSession> session_;
 };
 
+// ── Parameter bridge ──────────────────────────────────────────────────────
+//
+// One ParamBinding per bindable control discovered in the design. The control
+// is addressed across the C ABI by its string `key` (the design's pulpParamKey
+// when present, else the widget id). Each binding owns a StateStore parameter
+// (id == registration index + 1) whose name == key; the StateStore is the
+// single source of truth, and the embed mirrors it both into the live widget
+// and out to the host.
+enum class ParamWidgetKind { knob, fader, toggle };
+
+struct ParamBinding {
+    std::string key;             // ABI identity (pulpParamKey or widget id)
+    std::string widget_id;       // widget the param drives
+    pulp::state::ParamID param_id = 0;
+    ParamWidgetKind kind = ParamWidgetKind::knob;
+    pulp::view::View* widget = nullptr;  // borrowed; owned by the view tree
+};
+
 }  // namespace
 
 // The opaque handle. Field order matters for teardown — see destroy().
@@ -249,6 +273,16 @@ struct PulpEmbedView {
     pulp::format::ViewSize size_hints{};
     bool opened = false;     // notify_attached() has fired
     std::string last_error;
+
+    // ── parameter bridge (ABI v2) ──
+    PulpEmbedHostCallbacks host_cb{};         // copied from the desc; may be all-NULL
+    void* host_ctx = nullptr;
+    std::vector<ParamBinding> params;         // stable, registration-ordered
+    std::unordered_map<std::string, size_t> key_to_index;
+    pulp::state::ListenerToken param_listener; // forwards store changes to host
+    // Guard: true while applying a HOST-driven change so the store listener does
+    // not bounce the value back out to host.set_param (feedback-loop break).
+    bool applying_host_change = false;
 };
 
 namespace {
@@ -259,13 +293,34 @@ PulpEmbedResult set_err(PulpEmbedView* v, PulpEmbedResult r, std::string msg) {
 }
 
 // Validate + normalize the descriptor. Returns PULP_EMBED_OK or an error.
+//
+// abi_version is accepted when it is <= the library's version: a v1 caller hands
+// a smaller struct (no host-bridge tail) and a v2 library reads that absent tail
+// as all-NULL. A caller from the FUTURE (abi_version greater than ours) is
+// rejected — we can't know its layout. struct_size gates how much of the desc
+// we may read.
 PulpEmbedResult check_desc(const PulpEmbedDesc* desc) {
     if (!desc) return PULP_EMBED_ERR_INVALID_ARG;
-    if (desc->abi_version != PULP_VIEW_EMBED_ABI_VERSION) return PULP_EMBED_ERR_INVALID_ARG;
+    if (desc->abi_version == 0 || desc->abi_version > PULP_VIEW_EMBED_ABI_VERSION)
+        return PULP_EMBED_ERR_INVALID_ARG;
     if (desc->struct_size < sizeof(uint32_t) * 2) return PULP_EMBED_ERR_INVALID_ARG;
     if (desc->logical_width <= 0 || desc->logical_height <= 0) return PULP_EMBED_ERR_INVALID_ARG;
     return PULP_EMBED_OK;
 }
+
+// Copy the desc's host-callback block into v, but ONLY when the caller's
+// struct_size actually reaches that trailing field. A v1 caller (or any caller
+// whose struct stops before `host`) leaves v->host_cb all-NULL = "no bridge".
+void capture_host_callbacks(PulpEmbedView* v, const PulpEmbedDesc* desc) {
+    v->host_ctx = desc->host_ctx;
+    const size_t need = offsetof(PulpEmbedDesc, host) + sizeof(PulpEmbedHostCallbacks);
+    if (desc->struct_size >= need) v->host_cb = desc->host;
+}
+
+// Forward declarations — the param-bridge builders are defined further down
+// (next to the host/session wiring) but the create paths above reference them.
+void build_param_bridge(PulpEmbedView* v);
+void poll_host_meters(PulpEmbedView* v);
 
 // Rewrite relative asset/font local_paths to absolute against base_dir so the
 // materializer can load rasterized images (e.g. the figma export's assets/*.png)
@@ -349,6 +404,11 @@ PulpEmbedResult create_from_json(const PulpEmbedDesc* desc,
     }
     v->backend = v->host->is_gpu_backed() ? PULP_EMBED_BACKEND_GPU : PULP_EMBED_BACKEND_CPU;
 
+    // Interactive parameter bridge (ABI v2): also available on the native
+    // DesignIR tree path (Knob/Fader/Toggle widgets carry their node ids).
+    capture_host_callbacks(v.get(), desc);
+    build_param_bridge(v.get());
+
     if (desc->design_width > 0 && desc->design_height > 0) {
         v->host->set_design_viewport(static_cast<float>(desc->design_width),
                                      static_cast<float>(desc->design_height));
@@ -377,6 +437,191 @@ void wire_scripted_session_to_host(PulpEmbedView* v) {
         std::string err;
         scripted->poll(&err);
     });
+}
+
+// ── parameter bridge wiring ────────────────────────────────────────────────
+
+// Recursively classify a view as a bindable control. Returns true + writes the
+// kind when the view is a Knob / Fader / Toggle, false otherwise.
+bool classify_bindable(pulp::view::View* w, ParamWidgetKind* out_kind) {
+    if (dynamic_cast<pulp::view::Knob*>(w))   { *out_kind = ParamWidgetKind::knob;   return true; }
+    if (dynamic_cast<pulp::view::Fader*>(w))  { *out_kind = ParamWidgetKind::fader;  return true; }
+    if (dynamic_cast<pulp::view::Toggle*>(w)) { *out_kind = ParamWidgetKind::toggle; return true; }
+    return false;
+}
+
+// Read a control's current normalized [0,1] value.
+float widget_normalized(pulp::view::View* w, ParamWidgetKind kind) {
+    switch (kind) {
+        case ParamWidgetKind::knob:
+            return static_cast<pulp::view::Knob*>(w)->value();
+        case ParamWidgetKind::fader:
+            return static_cast<pulp::view::Fader*>(w)->value();
+        case ParamWidgetKind::toggle:
+            return static_cast<pulp::view::Toggle*>(w)->is_on() ? 1.0f : 0.0f;
+    }
+    return 0.0f;
+}
+
+// Apply a normalized [0,1] value to a control (programmatic; does NOT fire the
+// widget's on_change — see widgets.cpp set_value / set_on, which only repaint).
+void widget_set_normalized(pulp::view::View* w, ParamWidgetKind kind, float v) {
+    switch (kind) {
+        case ParamWidgetKind::knob:
+            static_cast<pulp::view::Knob*>(w)->set_value(v); break;
+        case ParamWidgetKind::fader:
+            static_cast<pulp::view::Fader*>(w)->set_value(v); break;
+        case ParamWidgetKind::toggle:
+            static_cast<pulp::view::Toggle*>(w)->set_on(v > 0.5f); break;
+    }
+}
+
+// Walk the view tree depth-first, collecting bindable controls in document
+// order so the param index is stable and matches the design's reading order.
+void collect_bindable(pulp::view::View* v, std::vector<ParamBinding>& out) {
+    if (!v) return;
+    ParamWidgetKind kind;
+    if (!v->id().empty() && classify_bindable(v, &kind)) {
+        ParamBinding b;
+        b.widget_id = v->id();
+        b.key = v->id();        // default key == widget id (no metadata in ui.js)
+        b.kind = kind;
+        b.widget = v;
+        out.push_back(std::move(b));
+    }
+    for (size_t i = 0; i < v->child_count(); ++i)
+        collect_bindable(v->child_at(i), out);
+}
+
+// Install the UI->host hooks on one control. Composes with (does not clobber)
+// any on_change the WidgetBridge already installed for JS dispatch.
+void wire_widget_to_host(PulpEmbedView* v, const ParamBinding& b) {
+    auto* store = v->store.get();
+    const pulp::state::ParamID pid = b.param_id;
+
+    if (b.kind == ParamWidgetKind::knob || b.kind == ParamWidgetKind::fader) {
+        auto prev_change = (b.kind == ParamWidgetKind::knob)
+            ? static_cast<pulp::view::Knob*>(b.widget)->on_change
+            : static_cast<pulp::view::Fader*>(b.widget)->on_change;
+
+        auto on_change = [v, store, pid, prev_change](float val) {
+            if (prev_change) prev_change(val);  // keep JS dispatch alive
+            // UI-driven write: store is the source of truth, and its listener
+            // forwards to host.set_param (applying_host_change is false here).
+            store->set_normalized(pid, val);
+        };
+        auto on_begin = [store, pid]() { store->begin_gesture(pid); };
+        auto on_end   = [store, pid]() { store->end_gesture(pid); };
+
+        if (b.kind == ParamWidgetKind::knob) {
+            auto* k = static_cast<pulp::view::Knob*>(b.widget);
+            k->on_change = on_change;
+            k->on_gesture_begin = on_begin;
+            k->on_gesture_end = on_end;
+        } else {
+            auto* f = static_cast<pulp::view::Fader*>(b.widget);
+            f->on_change = on_change;
+            f->on_gesture_begin = on_begin;
+            f->on_gesture_end = on_end;
+        }
+    } else {  // toggle — no gesture phases; click = begin/set/end atomically
+        auto* t = static_cast<pulp::view::Toggle*>(b.widget);
+        auto prev = t->on_toggle;
+        t->on_toggle = [v, store, pid, prev](bool on) {
+            if (prev) prev(on);
+            store->begin_gesture(pid);
+            store->set_normalized(pid, on ? 1.0f : 0.0f);
+            store->end_gesture(pid);
+        };
+    }
+}
+
+// Build the parameter registry: discover bindable controls, register one
+// StateStore param per control (name == key), seed it from the widget, wire the
+// UI->host hooks, and install a single store listener that forwards UI-driven
+// value changes to host.set_param. Gesture begin/end forward through
+// StateStore::set_gesture_callbacks. Idempotent per view (called once at create).
+void build_param_bridge(PulpEmbedView* v) {
+    if (!v || !v->store || !v->bridge) return;
+    auto* root = v->bridge->view();
+    if (!root) return;
+
+    collect_bindable(root, v->params);
+
+    for (size_t i = 0; i < v->params.size(); ++i) {
+        auto& b = v->params[i];
+        b.param_id = static_cast<pulp::state::ParamID>(i + 1);  // 0 reserved
+        v->key_to_index[b.key] = i;
+
+        pulp::state::ParamInfo info;
+        info.id = b.param_id;
+        info.name = b.key;
+        info.range = pulp::state::ParamRange{0.0f, 1.0f, 0.0f, 0.0f};
+        v->store->add_parameter(info);
+
+        // Seed: prefer the host's current value (automation/preset already set
+        // before the editor opened), else the widget's imported default.
+        float seed = widget_normalized(b.widget, b.kind);
+        if (v->host_cb.get_param) {
+            double hv = v->host_cb.get_param(v->host_ctx, b.key.c_str());
+            if (hv >= 0.0 && hv <= 1.0) {
+                seed = static_cast<float>(hv);
+                widget_set_normalized(b.widget, b.kind, seed);
+            }
+        }
+        v->store->set_normalized(b.param_id, seed);
+
+        wire_widget_to_host(v, b);
+    }
+
+    // Gesture begin/end forwarding (one set of callbacks for the whole store).
+    if (v->host_cb.begin_gesture || v->host_cb.end_gesture) {
+        PulpEmbedView* self = v;
+        v->store->set_gesture_callbacks(
+            [self](pulp::state::ParamID id) {
+                if (!self->host_cb.begin_gesture) return;
+                if (id == 0 || id > self->params.size()) return;
+                self->host_cb.begin_gesture(self->host_ctx,
+                                            self->params[id - 1].key.c_str());
+            },
+            [self](pulp::state::ParamID id) {
+                if (!self->host_cb.end_gesture) return;
+                if (id == 0 || id > self->params.size()) return;
+                self->host_cb.end_gesture(self->host_ctx,
+                                          self->params[id - 1].key.c_str());
+            });
+    }
+
+    // Value-change forwarding: UI writes -> host.set_param. Suppressed while a
+    // host-driven change is being applied (pulp_embed_param_changed).
+    if (v->host_cb.set_param) {
+        PulpEmbedView* self = v;
+        v->param_listener = v->store->add_listener(
+            [self](pulp::state::ParamID id, float /*denorm*/) {
+                if (self->applying_host_change) return;          // break the loop
+                if (!self->host_cb.set_param) return;
+                if (id == 0 || id > self->params.size()) return;
+                const auto& b = self->params[id - 1];
+                self->host_cb.set_param(self->host_ctx, b.key.c_str(),
+                                        self->store->get_normalized(id));
+            },
+            pulp::state::ListenerThread::Main);
+    }
+}
+
+// Poll host meters once (called from tick). Designs without meter widgets and
+// hosts without a read_meters callback make this a no-op. The figma fixture has
+// no meters, so this is currently a forwarding stub kept ready for meter-bearing
+// designs (see report note).
+void poll_host_meters(PulpEmbedView* v) {
+    if (!v || !v->host_cb.read_meters) return;
+    constexpr int kCap = pulp::view::MeterData::max_channels;
+    float levels[kCap] = {};
+    int n = v->host_cb.read_meters(v->host_ctx, levels, kCap);
+    (void)n;
+    // No meter widgets in the current importer JS bundle surface. When the
+    // scripted bundle gains createMeter bindings, route `levels` through the
+    // session's AudioBridge here.
 }
 
 // Shared create path for the high-fidelity scripted-UI bundle. bundle_dir must
@@ -443,6 +688,11 @@ PulpEmbedResult create_from_bundle(const PulpEmbedDesc* desc,
 
     // Load-bearing for scripted/GPU fidelity — see wire_scripted_session_to_host.
     wire_scripted_session_to_host(v.get());
+
+    // Interactive parameter bridge (ABI v2): discover the design's controls,
+    // register them in the StateStore, and wire UI<->host param + gesture flow.
+    capture_host_callbacks(v.get(), desc);
+    build_param_bridge(v.get());
 
     if (desc->design_width > 0 && desc->design_height > 0) {
         v->host->set_design_viewport(static_cast<float>(desc->design_width),
@@ -588,6 +838,10 @@ PulpEmbedResult pulp_embed_resize(PulpEmbedView* v, int32_t w, int32_t h, float 
 PulpEmbedResult pulp_embed_tick(PulpEmbedView* v) {
     if (!v || !v->host) return PULP_EMBED_ERR_INVALID_ARG;
     try {
+        // Drain any host param writes queued from the audio thread, then pull
+        // the latest meter levels for designs that have meters.
+        if (v->store) v->store->pump_listeners();
+        poll_host_meters(v);
         v->host->repaint();
         return PULP_EMBED_OK;
     } catch (...) {
@@ -621,6 +875,78 @@ PulpEmbedResult pulp_embed_size_hints(PulpEmbedView* v, PulpEmbedSizeHints* out)
 
 int32_t pulp_embed_active_backend(PulpEmbedView* v) {
     return v ? static_cast<int32_t>(v->backend) : PULP_EMBED_BACKEND_UNKNOWN;
+}
+
+// ── parameter bridge (ABI v2) ──────────────────────────────────────────────
+
+namespace {
+// Copy `s` into buf (NUL-terminated, truncated to cap); return s.size().
+size_t copy_str(const std::string& s, char* buf, size_t cap) {
+    if (buf && cap) {
+        const size_t n = s.size() < cap - 1 ? s.size() : cap - 1;
+        std::memcpy(buf, s.data(), n);
+        buf[n] = '\0';
+    }
+    return s.size();
+}
+}  // namespace
+
+int32_t pulp_embed_param_count(PulpEmbedView* v) {
+    return v ? static_cast<int32_t>(v->params.size()) : 0;
+}
+
+size_t pulp_embed_param_key(PulpEmbedView* v, int32_t index, char* buf, size_t cap) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->params.size()) {
+        if (buf && cap) buf[0] = '\0';
+        return 0;
+    }
+    return copy_str(v->params[static_cast<size_t>(index)].key, buf, cap);
+}
+
+size_t pulp_embed_param_widget_id(PulpEmbedView* v, int32_t index, char* buf, size_t cap) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->params.size()) {
+        if (buf && cap) buf[0] = '\0';
+        return 0;
+    }
+    return copy_str(v->params[static_cast<size_t>(index)].widget_id, buf, cap);
+}
+
+double pulp_embed_param_value(PulpEmbedView* v, int32_t index) {
+    if (!v || !v->store || index < 0 ||
+        static_cast<size_t>(index) >= v->params.size())
+        return -1.0;
+    return static_cast<double>(
+        v->store->get_normalized(v->params[static_cast<size_t>(index)].param_id));
+}
+
+PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* v, const char* key, double normalized) {
+    if (!v || !key || !v->store) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto it = v->key_to_index.find(key);
+        if (it == v->key_to_index.end()) return PULP_EMBED_OK;  // unknown key: no-op
+        auto& b = v->params[it->second];
+
+        const float val = static_cast<float>(
+            normalized < 0.0 ? 0.0 : (normalized > 1.0 ? 1.0 : normalized));
+
+        // Suppress the store listener's host-forward so a host-driven change
+        // does not echo back to host.set_param (feedback-loop break).
+        v->applying_host_change = true;
+        v->store->set_normalized(b.param_id, val);
+        v->applying_host_change = false;
+
+        // Mirror into the live widget (set_value/set_on does not fire on_change,
+        // so this stays a one-way host->view push) and repaint.
+        if (b.widget) widget_set_normalized(b.widget, b.kind, val);
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        v->applying_host_change = false;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        v->applying_host_change = false;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "param_changed threw");
+    }
 }
 
 PulpEmbedResult pulp_embed_capture_png(PulpEmbedView* v, uint8_t* out,
@@ -701,6 +1027,12 @@ void pulp_embed_destroy(PulpEmbedView* v) {
         }
         if (v->bridge) { v->bridge->close(); v->bridge.reset(); }
         v->processor.reset();
+        // Drop the param-bridge subscriptions (which capture `v`) BEFORE the
+        // store they target is destroyed. The widgets the param bindings borrow
+        // are already gone with the bridge above; null them defensively.
+        v->param_listener.reset();
+        if (v->store) v->store->set_gesture_callbacks(nullptr, nullptr);
+        for (auto& b : v->params) b.widget = nullptr;
         v->store.reset();
     } catch (...) {
         // swallow — destroy must not throw across the C boundary
