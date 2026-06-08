@@ -18,6 +18,7 @@
 #include <pulp/state/parameter.hpp>
 #include <pulp/state/store.hpp>
 #include <pulp/view/design_frame_view.hpp>
+#include <pulp/view/text_editor.hpp>
 #include <pulp/view/design_import.hpp>
 #include <pulp/view/design_ir.hpp>
 #include <pulp/view/plugin_view_host.hpp>
@@ -118,6 +119,24 @@ public:
         int option_count = 0;
         float default_norm = 0.5f;
     };
+    // text_field elements (skipped by faithful_element_keys, which only covers
+    // normalized params) — for the ABI v6 string bridge. (index, key) in frame
+    // element order; key is the source node id, else a synthetic "text:i".
+    std::vector<std::pair<int, std::string>> faithful_text_field_keys() const {
+        std::vector<std::pair<int, std::string>> out;
+        const pulp::view::IRNode* frame = find_faithful_node(ir_.root);
+        if (!frame) return out;
+        using K = pulp::view::InteractiveElementKind;
+        for (int i = 0; i < static_cast<int>(frame->interactive_elements.size()); ++i) {
+            const auto& e = frame->interactive_elements[static_cast<size_t>(i)];
+            if (e.kind != K::text_field) continue;
+            std::string key = e.source_node_id.value_or("");
+            if (key.empty()) key = "text:" + std::to_string(i);
+            out.emplace_back(i, std::move(key));
+        }
+        return out;
+    }
+
     std::vector<FaithfulMeta> faithful_element_metas() const {
         std::vector<FaithfulMeta> out;
         const pulp::view::IRNode* frame = find_faithful_node(ir_.root);
@@ -452,6 +471,18 @@ struct PulpEmbedView {
     // not bounce the value back out to host.set_param (feedback-loop break).
     bool applying_host_change = false;
 
+    // ── text-field string bridge (ABI v6) ──
+    // One entry per bindable text_field; `widget` is the DesignFrameView's overlay
+    // TextEditor. key == the text_field's design key (source node id). Strings are
+    // host/plugin STATE (not automatable). applying_host_string guards set_text
+    // from echoing back to host.set_string.
+    struct StringBinding {
+        std::string key;
+        pulp::view::TextEditor* widget = nullptr;
+    };
+    std::vector<StringBinding> strings;
+    bool applying_host_string = false;
+
     // Thread that created the view. pulp_embed_reload_bundle (which rebuilds views
     // + touches the GPU surface) must run here; a call from another thread is
     // rejected with PULP_EMBED_ERR_WRONG_THREAD. Captured at construction.
@@ -501,6 +532,7 @@ void capture_host_callbacks(PulpEmbedView* v, const PulpEmbedDesc* desc) {
 // Forward declarations — the param-bridge builders are defined further down
 // (next to the host/session wiring) but the create paths above reference them.
 void build_param_bridge(PulpEmbedView* v);
+void build_string_bridge(PulpEmbedView* v);
 void poll_host_meters(PulpEmbedView* v);
 
 // ── host resource staging (resolve_resource, ABI v3) ───────────────────────
@@ -1007,6 +1039,48 @@ void build_param_bridge(PulpEmbedView* v) {
         frame->on_gesture_end = [self, pid_for](int idx) {
             if (auto pid = pid_for(idx)) self->store->end_gesture(pid);
         };
+    }
+
+    // ABI v6: text_field string bridge (separate from the numeric params above).
+    build_string_bridge(v);
+}
+
+// Build the text-field string bridge (ABI v6): discover bindable text_field
+// overlay editors, seed each from host.get_string, and forward user edits to
+// host.set_string. Strings are host/plugin state, not normalized params.
+void build_string_bridge(PulpEmbedView* v) {
+    v->strings.clear();
+    if (!v || !v->bridge) return;
+    auto* root = v->bridge->view();
+    auto* ep = dynamic_cast<EmbedProcessor*>(v->processor.get());
+    if (!root || !ep) return;  // string bridge is the faithful-vector lane today
+    auto* frame = find_design_frame_view(root);
+    if (!frame) return;
+
+    for (auto& [idx, key] : ep->faithful_text_field_keys()) {
+        auto* te = dynamic_cast<pulp::view::TextEditor*>(frame->overlay_widget(idx));
+        if (!te) continue;
+        // Seed from host state (preset recall) before wiring the change hook.
+        if (v->host_cb.get_string) {
+            char buf[2048] = {0};
+            const int32_t n = v->host_cb.get_string(v->host_ctx, key.c_str(), buf,
+                                                     static_cast<int32_t>(sizeof buf));
+            if (n >= 0) {
+                buf[sizeof buf - 1] = '\0';
+                v->applying_host_string = true;
+                te->set_text(buf);
+                v->applying_host_string = false;
+            }
+        }
+        // User edit -> host (suppressed while we apply a host-driven set_text).
+        PulpEmbedView* self = v;
+        const std::string k = key;
+        te->on_change = [self, k](const std::string& text) {
+            if (self->applying_host_string) return;
+            if (self->host_cb.set_string)
+                self->host_cb.set_string(self->host_ctx, k.c_str(), text.c_str());
+        };
+        v->strings.push_back({key, te});
     }
 }
 
@@ -1560,6 +1634,66 @@ PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* v, const char* key, doub
     } catch (...) {
         v->applying_host_change = false;
         return set_err(v, PULP_EMBED_ERR_INTERNAL, "param_changed threw");
+    }
+}
+
+// ── text-field string bridge (ABI v6) — reuses the file's copy_str() helper ──
+int32_t pulp_embed_string_param_count(PulpEmbedView* v) {
+    return v ? static_cast<int32_t>(v->strings.size()) : 0;
+}
+
+size_t pulp_embed_string_param_key(PulpEmbedView* v, int32_t index, char* buf, size_t cap) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->strings.size()) {
+        if (buf && cap > 0) buf[0] = '\0';
+        return 0;
+    }
+    return copy_str(v->strings[static_cast<size_t>(index)].key, buf, cap);
+}
+
+size_t pulp_embed_get_string(PulpEmbedView* v, const char* key, char* buf, size_t cap) {
+    if (buf && cap > 0) buf[0] = '\0';
+    if (!v || !key) return 0;
+    for (const auto& s : v->strings)
+        if (s.key == key && s.widget) return copy_str(s.widget->text(), buf, cap);
+    return 0;
+}
+
+PulpEmbedResult pulp_embed_set_string(PulpEmbedView* v, const char* key, const char* utf8) {
+    if (!v || !key) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        for (auto& s : v->strings) {
+            if (s.key != key || !s.widget) continue;
+            // Apply without echoing back through TextEditor::on_change -> set_string.
+            v->applying_host_string = true;
+            s.widget->set_text(utf8 ? utf8 : "");
+            v->applying_host_string = false;
+            break;
+        }
+        return PULP_EMBED_OK;  // unknown key tolerated (blind-push), like param_changed
+    } catch (const std::exception& e) {
+        v->applying_host_string = false;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        v->applying_host_string = false;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "set_string threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_simulate_text_input(PulpEmbedView* v, int32_t index, const char* utf8) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->strings.size())
+        return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto* te = v->strings[static_cast<size_t>(index)].widget;
+        if (!te) return set_err(v, PULP_EMBED_ERR_INVALID_ARG, "string widget gone");
+        // Real edit path (NOT guarded) — set_text fires on_change -> host.set_string,
+        // exactly as a user typing would.
+        te->set_text(utf8 ? utf8 : "");
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "simulate_text_input threw");
     }
 }
 
