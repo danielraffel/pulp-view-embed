@@ -378,6 +378,35 @@ ctest --test-dir build --output-on-failure   # runs the macOS embed smoke
 `-DPULP_VIEW_EMBED_SHARED=ON` builds `libpulp_view_embed.dylib` (a stable ABI a
 foreign host links without seeing Pulp C++ symbols); default is a static lib.
 
+## Preflight validation (`pulp-embed-validate`)
+
+A **build-time preflight** for a design bundle, run BEFORE it's embedded into a
+plugin. It validates the design *at the seam a foreign host consumes it* —
+something the plugin-binary validators (`auval` / `pluginval` / `clap-validator`,
+and JUCE's `pluginval`) structurally can't: they validate the assembled
+`.vst3`/`.component`/`.clap` and understand nothing about a Pulp design. This
+complements them; it does not replace them.
+
+```bash
+pulp-embed-validate <bundle-dir | design.ir.json> \
+  [--design-w N --design-h N] [--scale F] \
+  [--host-keys k1,k2,...]   # report bound vs visual-only controls + dangling host keys
+  [--out render.png] [--golden ref.png]
+```
+
+It checks: the design **parses + materializes** through the embed ABI; every
+bindable control **key is non-empty and unique** (keys collide in the host
+bridge otherwise); every **render-referenced asset resolves** on disk (the
+faithful lane's `svg_asset_id` and fonts, or a bundle's `ui.js` asset literals —
+unreferenced fallback rasters are noted, not failed, so it won't false-positive
+on a faithful design); and the **deterministic Skia render is non-blank** (with
+an optional byte-exact `--golden` compare). Pure C++ / headless (no window or GPU
+back-buffer), so it runs in CI and is portable to the Win/Linux hosts. Exit 0 =
+all pass, 1 = a check failed, 2 = usage. Wired as the `embed-validate-faithful`
+ctest. With `--host-keys` (your adapter's param keys — the same key→param map the
+JUCE/iPlug2 binding uses) it reports which design controls actually bind vs stay
+visual-only, and host keys with no matching control.
+
 ## Distribution
 
 To ship this to a foreign host that does **not** build Pulp from source, see

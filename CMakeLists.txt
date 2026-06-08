@@ -147,3 +147,21 @@ if(APPLE)
     target_link_libraries(pulp-embed-design-render PRIVATE
         pulp_view_embed "-framework AppKit")
 endif()
+
+# ── embed-bundle preflight (`pulp embed validate`) ───────────────────────────
+# Build-time validation of a design bundle AT THE SEAM a foreign host consumes
+# it (parse + materialize + non-blank render + asset resolution + param-bridge
+# report) — complementary to the plugin-binary validators (auval/pluginval/
+# clap-validator), which understand nothing about a Pulp design. Pure C++ /
+# deterministic Skia render, so it runs headless and is portable to Win/Linux.
+enable_testing()
+add_executable(pulp-embed-validate tools/pulp_embed_validate.cpp)
+target_link_libraries(pulp-embed-validate PRIVATE pulp_view_embed)
+if(APPLE)
+    target_link_libraries(pulp-embed-validate PRIVATE "-framework AppKit")
+endif()
+# Self-test: the faithful "VST Style" fixture must pass the preflight clean.
+add_test(NAME embed-validate-faithful
+    COMMAND pulp-embed-validate
+        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/figma-vst-style-faithful/design.ir.json"
+        --design-w 1000 --design-h 600)
