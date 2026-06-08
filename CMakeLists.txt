@@ -168,6 +168,12 @@ target_link_libraries(pulp-embed-validate PRIVATE pulp_view_embed)
 if(APPLE)
     target_link_libraries(pulp-embed-validate PRIVATE "-framework AppKit")
 endif()
+# Linux: re-mention fontconfig AFTER libskia.a on the link line (single-pass GNU
+# ld; the Skia archive references Fc* symbols). The helper ships with the SDK and
+# is exposed by PulpConfig.cmake; COMMAND-guarded for older SDKs that predate it.
+if(UNIX AND NOT APPLE AND NOT ANDROID AND COMMAND pulp_link_fontconfig_after_skia)
+    pulp_link_fontconfig_after_skia(pulp-embed-validate)
+endif()
 # Self-test: the faithful "VST Style" fixture must pass the preflight clean.
 add_test(NAME embed-validate-faithful
     COMMAND pulp-embed-validate
