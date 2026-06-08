@@ -180,4 +180,26 @@ add_test(NAME embed-validate-faithful
         "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/figma-vst-style-faithful/design.ir.json"
         --design-w 1000 --design-h 600)
 
+# Linux: live X11 host smoke — attach Pulp's child into a real X11 parent window
+# and capture the live back buffer (proves the X11PluginViewHost attach path, not
+# just the headless render). Needs an X server at runtime (run via xvfb-run); the
+# ctest wraps it in xvfb-run when found, else marks the test skipped.
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    find_package(X11)
+    if(X11_FOUND)
+        add_executable(pulp-embed-linux-x11-smoke examples/linux-x11-smoke/smoke.cpp)
+        target_link_libraries(pulp-embed-linux-x11-smoke PRIVATE pulp_view_embed X11::X11)
+        if(COMMAND pulp_link_fontconfig_after_skia)
+            pulp_link_fontconfig_after_skia(pulp-embed-linux-x11-smoke)
+        endif()
+        find_program(XVFB_RUN xvfb-run)
+        if(XVFB_RUN)
+            add_test(NAME embed-x11-smoke COMMAND ${XVFB_RUN} -a
+                $<TARGET_FILE:pulp-embed-linux-x11-smoke>
+                "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/figma-vst-style-faithful/design.ir.json"
+                1000 600)
+        endif()
+    endif()
+endif()
+
 endif()  # top-level only (CMAKE_SOURCE_DIR == CMAKE_CURRENT_SOURCE_DIR)
