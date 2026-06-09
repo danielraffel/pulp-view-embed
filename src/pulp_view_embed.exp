@@ -43,6 +43,8 @@ _pulp_embed_get_string
 _pulp_embed_set_string
 _pulp_embed_simulate_param_drag
 _pulp_embed_simulate_text_input
+_pulp_embed_dispatch_mouse_move
+_pulp_embed_dispatch_mouse_exit
 _pulp_embed_size_hints
 _pulp_embed_string_param_count
 _pulp_embed_string_param_key
