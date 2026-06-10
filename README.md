@@ -9,8 +9,6 @@ linking Pulp's C++ ABI.
 > an interactive host↔view parameter bridge (a dragged control moves a host
 > parameter; host automation moves the control), a host resource-resolution
 > callback, and an offscreen/texture render mode. Not for production yet.
-> See `planning/2026-06-06-foreign-host-embedding-revised-plan.md` in the Pulp
-> repo for the roadmap.
 
 ## Status / what works / known limitations / roadmap
 
