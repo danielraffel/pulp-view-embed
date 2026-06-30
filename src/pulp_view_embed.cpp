@@ -11,6 +11,7 @@
 // (destroys the View), then drop processor/store.
 
 #include "pulp_view_embed.h"
+#include "pulp_view_embed_native.hpp"  // C++ native-view create entry
 
 #include <pulp/format/processor.hpp>
 #include <pulp/format/view_bridge.hpp>
@@ -54,6 +55,7 @@ thread_local std::string g_create_error;
 // The two Processor facades live in embed_processors.hpp (split out for
 // readability); pull them into this TU's unqualified scope so the create /
 // teardown / query paths below name them as before.
+using pulp::embed::shim::EmbedNativeViewProcessor;
 using pulp::embed::shim::EmbedProcessor;
 using pulp::embed::shim::EmbedScriptedProcessor;
 
@@ -309,6 +311,64 @@ void resolve_asset_paths(PulpEmbedView* v, pulp::view::DesignIR& ir,
     // absolute. So no separate font-path rewrite is needed here.
 }
 
+// Shared create tail for every lane (DesignIR, ui.js bundle, native View): open
+// the ViewBridge over v->processor, lay out the first frame, attach a
+// PluginViewHost (or stay offscreen), build the host-param bridge, and apply the
+// optional design viewport. On entry v->processor / v->offscreen must be set,
+// host callbacks captured, and v->size_hints filled. Leaves v owned by the
+// caller (no release) so a lane can run its own extra steps — e.g. the DesignIR
+// lane's missing-asset scan — before publishing the handle. Returns OK or the
+// specific failure code (g_create_error carries detail).
+PulpEmbedResult open_and_bridge(PulpEmbedView* v, const PulpEmbedDesc* desc,
+                                uint32_t w, uint32_t h) {
+    v->store = std::make_unique<pulp::state::StateStore>();
+    v->bridge = std::make_unique<pulp::format::ViewBridge>(*v->processor, *v->store);
+
+    std::string err;
+    if (!v->bridge->open(&err)) {
+        g_create_error = "view open failed: " + err;
+        return PULP_EMBED_ERR_VIEW_OPEN;
+    }
+    if (!v->bridge->view()) {
+        g_create_error = "materialized view tree is empty";
+        return PULP_EMBED_ERR_MATERIALIZE;
+    }
+
+    // A freshly built tree has no laid-out bounds; give the root the logical
+    // size and run Yoga so the first frame paints (the host renders the tree but
+    // does not itself lay out a guest view).
+    if (auto* rv = v->bridge->view()) {
+        rv->set_bounds({0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h)});
+        rv->layout_children();
+    }
+
+    if (!v->offscreen) {
+        pulp::view::PluginViewHost::Options opts;
+        opts.size = {w, h};
+        opts.use_gpu = (desc->backend_pref != PULP_EMBED_BACKEND_PREF_CPU);
+        v->host = pulp::view::PluginViewHost::create(*v->bridge->view(), opts);
+        if (!v->host) {
+            g_create_error = "no PluginViewHost (missing platform factory?)";
+            return PULP_EMBED_ERR_HOST_CREATE;
+        }
+        v->backend = v->host->is_gpu_backed() ? PULP_EMBED_BACKEND_GPU
+                                              : PULP_EMBED_BACKEND_CPU;
+    } else {
+        // Offscreen: no live host. Frames come from the deterministic renderer.
+        v->backend = PULP_EMBED_BACKEND_CPU;
+    }
+
+    // Interactive parameter bridge (ABI v2): Knob/Fader/Toggle widgets (DesignIR
+    // tree), DesignFrameView elements (faithful + native lanes), and text fields.
+    build_param_bridge(v);
+
+    if (!v->offscreen && desc->design_width > 0 && desc->design_height > 0) {
+        v->host->set_design_viewport(static_cast<float>(desc->design_width),
+                                     static_cast<float>(desc->design_height));
+    }
+    return PULP_EMBED_OK;
+}
+
 // Shared create path over an already-loaded JSON string. asset_base_dir is the
 // directory relative asset paths resolve against (the IR file's dir, or
 // desc->asset_base_path for the in-memory variant). When `offscreen` is true the
@@ -347,56 +407,14 @@ PulpEmbedResult create_from_json(const PulpEmbedDesc* desc,
     v->size_hints = pulp::format::view_size_from_design(w, h);
 
     v->processor = std::make_unique<EmbedProcessor>(std::move(ir), v->size_hints);
-    v->store = std::make_unique<pulp::state::StateStore>();
-    v->bridge = std::make_unique<pulp::format::ViewBridge>(*v->processor, *v->store);
 
-    std::string err;
-    if (!v->bridge->open(&err)) {
-        g_create_error = "view open failed: " + err;
-        return PULP_EMBED_ERR_VIEW_OPEN;
-    }
-    if (!v->bridge->view()) {
-        g_create_error = "materialized view tree is empty";
-        return PULP_EMBED_ERR_MATERIALIZE;
-    }
-
-    // A freshly materialized DesignIR tree has no laid-out bounds; give the root
-    // the logical size and run Yoga so the first frame paints (the host renders
-    // the tree but does not itself lay out a guest view).
-    if (auto* rv = v->bridge->view()) {
-        rv->set_bounds({0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h)});
-        rv->layout_children();
-    }
-
-    if (!offscreen) {
-        pulp::view::PluginViewHost::Options opts;
-        opts.size = {w, h};
-        opts.use_gpu = (desc->backend_pref != PULP_EMBED_BACKEND_PREF_CPU);
-        v->host = pulp::view::PluginViewHost::create(*v->bridge->view(), opts);
-        if (!v->host) {
-            g_create_error = "no PluginViewHost (missing platform factory?)";
-            return PULP_EMBED_ERR_HOST_CREATE;
-        }
-        v->backend = v->host->is_gpu_backed() ? PULP_EMBED_BACKEND_GPU
-                                              : PULP_EMBED_BACKEND_CPU;
-    } else {
-        // Offscreen: no live host. Frames come from the deterministic renderer.
-        v->backend = PULP_EMBED_BACKEND_CPU;
-    }
-
-    // Interactive parameter bridge (ABI v2): also available on the native
-    // DesignIR tree path (Knob/Fader/Toggle widgets carry their node ids).
-    build_param_bridge(v.get());
+    if (auto r = open_and_bridge(v.get(), desc, w, h); r != PULP_EMBED_OK)
+        return r;
 
     // Missing-asset diagnostics (ABI v7): walk the DesignIR asset manifest and
     // record any svg/image whose resolved local_path is absent on disk, so the
     // host preflight can query it authoritatively instead of re-parsing JSON.
     collect_missing_render_assets(v.get());
-
-    if (!offscreen && desc->design_width > 0 && desc->design_height > 0) {
-        v->host->set_design_viewport(static_cast<float>(desc->design_width),
-                                     static_cast<float>(desc->design_height));
-    }
 
     *out_view = v.release();
     return PULP_EMBED_OK;
@@ -604,6 +622,48 @@ void build_param_bridge(PulpEmbedView* v) {
                     b.default_norm = metas[k].default_norm;
                     b.name = metas[k].label;  // §2.1: design caption -> param name
                 }
+                v->params.push_back(std::move(b));
+            }
+        }
+    }
+
+    // Native-view lane: a hand-built DesignFrameView (mounted via
+    // pulp_embed_create_from_view) carries no DesignIR, so keys come off the LIVE
+    // view — element_param_key(i) is the host param id the author declared. Bind
+    // every value-bearing element with a non-empty key; everything downstream
+    // (store param alloc, on_element_changed/gesture wiring, host->UI push) is
+    // shared with the faithful lane via frame_element_index. Discreteness metadata
+    // is reported coarsely (continuous) since the live view exposes no option
+    // count; the bind itself is correct for choice controls because
+    // element_value/set_element_value map the selection internally.
+    if (dynamic_cast<EmbedNativeViewProcessor*>(v->processor.get())) {
+        if (auto* frame = find_design_frame_view(root)) {
+            using Kind = pulp::view::DesignFrameElement::Kind;
+            for (int i = 0; i < frame->element_count(); ++i) {
+                const std::string& key = frame->element_param_key(i);
+                if (key.empty()) continue;
+                const Kind kind = frame->element_kind(i);
+                const char* wk = nullptr;
+                switch (kind) {
+                    case Kind::knob:      wk = "knob";      break;
+                    case Kind::fader:     wk = "fader";     break;
+                    case Kind::toggle:    wk = "toggle";    break;
+                    case Kind::dropdown:  wk = "dropdown";  break;
+                    case Kind::tab_group: wk = "tab_group"; break;
+                    case Kind::stepper:   wk = "stepper";   break;
+                    case Kind::xy_pad:    wk = "xy_pad";    break;
+                    // text_field is a string (not a normalized param); momentary /
+                    // swap / action / value_label / custom carry no host param.
+                    default: continue;
+                }
+                ParamBinding b;
+                b.key = key;
+                b.widget_id = key;
+                b.kind = ParamWidgetKind::knob;  // value carried via frame element
+                b.widget = frame;
+                b.frame_element_index = i;
+                b.widget_kind = wk;
+                b.default_norm = frame->element_value(i);  // imported default
                 v->params.push_back(std::move(b));
             }
         }
@@ -906,6 +966,48 @@ PulpEmbedResult create_from_bundle(const PulpEmbedDesc* desc,
 }
 
 }  // namespace
+
+// ── native-view create (C++ surface; see pulp_view_embed_native.hpp) ─────────
+// Mirrors create_from_json's shape but skips the DesignIR parse / asset resolve:
+// the root tree comes straight from the host factory. The shared open_and_bridge
+// tail then opens the ViewBridge, attaches the host, and (for a DesignFrameView
+// with param_key'd elements) wires the same string-key host bridge.
+namespace pulp::embed {
+
+PulpEmbedResult pulp_embed_create_from_view(const PulpEmbedDesc* desc,
+                                            NativeViewFactory factory,
+                                            PulpEmbedView** out_view) {
+    if (out_view) *out_view = nullptr;
+    g_create_error.clear();
+    if (auto r = check_desc(desc); r != PULP_EMBED_OK) {
+        g_create_error = "invalid descriptor";
+        return r;
+    }
+    if (!out_view) return PULP_EMBED_ERR_INVALID_ARG;
+    if (!factory) {
+        g_create_error = "null native-view factory";
+        return PULP_EMBED_ERR_INVALID_ARG;
+    }
+
+    auto v = std::make_unique<PulpEmbedView>();
+    v->offscreen = false;  // windowed: Pulp owns a child view in the host window
+    capture_host_callbacks(v.get(), desc);
+
+    const auto w = static_cast<uint32_t>(desc->logical_width);
+    const auto h = static_cast<uint32_t>(desc->logical_height);
+    v->size_hints = pulp::format::view_size_from_design(w, h);
+
+    v->processor =
+        std::make_unique<EmbedNativeViewProcessor>(std::move(factory), v->size_hints);
+
+    if (auto r = open_and_bridge(v.get(), desc, w, h); r != PULP_EMBED_OK)
+        return r;
+
+    *out_view = v.release();
+    return PULP_EMBED_OK;
+}
+
+}  // namespace pulp::embed
 
 extern "C" {
 
