@@ -521,6 +521,17 @@ PulpEmbedResult pulp_embed_dispatch_mouse_move(PulpEmbedView* view, double x, do
  * window loses focus. */
 PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* view);
 
+/* Host -> view: real pointer press / drag / release. Mirrors
+ * dispatch_mouse_move but routes to the hit widget's on_mouse_down/drag/up —
+ * the same path a native Pulp window runs — so embedded controls (knobs,
+ * faders, buttons) become draggable in a foreign host. Coordinates are
+ * root-view logical pixels. `down` hit-tests and captures the target; `drag`
+ * and `up` replay against the captured target; `up` clears it. Without these,
+ * the foreign-host embed only delivers hover (move), never a button gesture. */
+PulpEmbedResult pulp_embed_dispatch_mouse_down(PulpEmbedView* view, double x, double y);
+PulpEmbedResult pulp_embed_dispatch_mouse_drag(PulpEmbedView* view, double x, double y);
+PulpEmbedResult pulp_embed_dispatch_mouse_up(PulpEmbedView* view, double x, double y);
+
 /* ---- text-field string bridge (ABI v6) ------------------------------- *
  *
  * Separate from the numeric param bridge: a design's text_field controls carry a

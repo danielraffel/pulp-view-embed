@@ -22,6 +22,7 @@
 #include <pulp/view/text_editor.hpp>
 #include <pulp/view/design_import.hpp>
 #include <pulp/view/design_ir.hpp>
+#include <pulp/view/inspector.hpp>   // ViewInspector::absolute_bounds (drag coords)
 #include <pulp/view/plugin_view_host.hpp>
 #include <pulp/view/screenshot.hpp>
 #include <pulp/view/scripted_ui.hpp>
@@ -110,6 +111,10 @@ struct PulpEmbedView {
     bool opened = false;     // notify_attached() has fired
     bool offscreen = false;  // created via pulp_embed_create_offscreen (no host)
     std::string last_error;
+
+    // Widget captured at dispatch_mouse_down; drag/up replay against it until
+    // up clears it (borrowed pointer, owned by the view tree).
+    pulp::view::View* drag_target = nullptr;
 
     // ── host resource staging (ABI v3) ──
     // Temp dir holding host-served asset bytes (resolve_resource), written so the
@@ -1543,6 +1548,67 @@ PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* v) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
     } catch (...) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_exit threw");
+    }
+}
+
+// Press / drag / release. hit_test the root at the (root-space) point, then
+// dispatch to the target widget in ITS local coords (root point minus the
+// widget's absolute origin). down captures the target on the view; drag/up
+// replay against it. This is the minimal subset of the native plugin-view-host
+// mouse path (no focus/bubbling) — enough to make knobs/faders/buttons drag.
+static pulp::view::Point local_for(pulp::view::View* target, double x, double y) {
+    const auto ab = pulp::view::ViewInspector::absolute_bounds(*target);
+    return pulp::view::Point{static_cast<float>(x) - ab.x, static_cast<float>(y) - ab.y};
+}
+
+PulpEmbedResult pulp_embed_dispatch_mouse_down(PulpEmbedView* v, double x, double y) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto* root = v->bridge->view();
+        if (!root) return PULP_EMBED_ERR_INVALID_ARG;
+        v->drag_target = root->hit_test(pulp::view::Point{static_cast<float>(x),
+                                                          static_cast<float>(y)});
+        if (v->drag_target) {
+            v->drag_target->on_mouse_down(local_for(v->drag_target, x, y));
+            if (v->host) v->host->repaint();
+        }
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_down threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_dispatch_mouse_drag(PulpEmbedView* v, double x, double y) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        if (!v->drag_target) return PULP_EMBED_OK;
+        v->drag_target->on_mouse_drag(local_for(v->drag_target, x, y));
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_drag threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_dispatch_mouse_up(PulpEmbedView* v, double x, double y) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        if (v->drag_target) {
+            v->drag_target->on_mouse_up(local_for(v->drag_target, x, y));
+            if (v->host) v->host->repaint();
+        }
+        v->drag_target = nullptr;
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        v->drag_target = nullptr;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        v->drag_target = nullptr;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_up threw");
     }
 }
 
