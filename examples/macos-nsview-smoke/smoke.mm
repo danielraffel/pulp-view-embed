@@ -301,6 +301,27 @@ int main(int argc, const char* argv[]) {
                   "size_hints preferred matches desc");
             std::printf("    active backend: %s\n",
                         backend_name(pulp_embed_active_backend(v)));
+
+            // ── host->view hover dispatch (pulp_embed_dispatch_mouse_*) ──
+            // The dispatch shim forwards a host pointer into
+            // View::simulate_hover — the same hit-test a native Pulp window
+            // runs on real mouse moves. Assert the ABI contract on the
+            // detached CPU tree (no GPU needed): null-arg rejection plus a
+            // successful in-bounds move, an out-of-bounds move (which clears
+            // hover), and an exit. The hover *effect* (onMouseEnter/:hover)
+            // rides on View::simulate_hover, covered in the core view tests.
+            check(pulp_embed_dispatch_mouse_move(nullptr, 10, 10) ==
+                      PULP_EMBED_ERR_INVALID_ARG,
+                  "dispatch_mouse_move(NULL) rejects");
+            check(pulp_embed_dispatch_mouse_exit(nullptr) ==
+                      PULP_EMBED_ERR_INVALID_ARG,
+                  "dispatch_mouse_exit(NULL) rejects");
+            check(pulp_embed_dispatch_mouse_move(v, 160, 100) == PULP_EMBED_OK,
+                  "dispatch_mouse_move(valid, in-bounds) OK");
+            check(pulp_embed_dispatch_mouse_move(v, -5, -5) == PULP_EMBED_OK,
+                  "dispatch_mouse_move(valid, out-of-bounds clears hover) OK");
+            check(pulp_embed_dispatch_mouse_exit(v) == PULP_EMBED_OK,
+                  "dispatch_mouse_exit(valid) OK");
         }
 
         // ── M1.2: attach gate ────────────────────────────────────────────
