@@ -496,6 +496,31 @@ PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* view, const char* key, d
  * server; a real embedded UI is driven by the host's own mouse/touch events. */
 PulpEmbedResult pulp_embed_simulate_param_drag(PulpEmbedView* view, int32_t index, double target_normalized);
 
+/* Host -> view: tell the embed where the mouse pointer is, in ROOT-view
+ * coordinates (top-left origin, logical pixels matching the bounds passed
+ * to pulp_embed_resize). Triggers the same hover hit-test that drives CSS
+ * :hover / `onMouseEnter` / `onMouseLeave` in non-embed Pulp windows. Host
+ * adapters (pulp-embed-juce, future iPlug2/SDL wrappers) override their
+ * platform mouseMove and forward each move here.
+ *
+ * Without this, `registerHover(id)` correctly arms the lambdas but no code
+ * path ever calls `View::set_hovered(true)` in the embedded context, so the
+ * JS `onMouseEnter` handler never fires. Symmetric counterpart to the
+ * existing pulp_embed_simulate_* family but driven by the live host pointer,
+ * not a test harness.
+ *
+ * Returns PULP_EMBED_OK on dispatch, PULP_EMBED_ERR_INVALID_ARG for a NULL
+ * view. Coordinates outside the root bounds clear hover (matches Pulp's
+ * own platform behaviour when the pointer leaves the window). */
+PulpEmbedResult pulp_embed_dispatch_mouse_move(PulpEmbedView* view, double x, double y);
+
+/* Host -> view: tell the embed the mouse pointer left the view entirely.
+ * Equivalent to dispatching a mouse-move outside the root bounds — clears
+ * any active hover state so `onMouseLeave` fires on the previously-hovered
+ * widget. Host adapters call this from their platform mouseExit / when the
+ * window loses focus. */
+PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* view);
+
 /* ---- text-field string bridge (ABI v6) ------------------------------- *
  *
  * Separate from the numeric param bridge: a design's text_field controls carry a

@@ -1498,6 +1498,54 @@ PulpEmbedResult pulp_embed_simulate_text_input(PulpEmbedView* v, int32_t index, 
     }
 }
 
+// Host -> view hover dispatch (no ABI bump — additive function).
+//
+// Embedded plugins host Pulp inside a JUCE/iPlug2/SDL component that owns
+// its platform mouse-move events; pulp-view-embed itself never sees those
+// events. Without forwarding, `View::set_hovered` is never called from any
+// non-test path → `on_hover_enter` (wired by registerHover) never fires →
+// JS `onMouseEnter` handlers stay silent. Host adapters override their own
+// mouseMove and forward (x,y) here in root-view coords; the shim defers to
+// `View::simulate_hover`, which performs the same hit-test + set_hovered
+// hop a native Pulp window does on real mouse moves.
+//
+// Symmetric with the existing pulp_embed_simulate_* family. Named
+// `dispatch_*` rather than `simulate_*` because the source IS a real
+// pointer, not a synthetic test event.
+PulpEmbedResult pulp_embed_dispatch_mouse_move(PulpEmbedView* v, double x, double y) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto* root = v->bridge->view();
+        if (!root) return PULP_EMBED_ERR_INVALID_ARG;
+        root->simulate_hover(pulp::view::Point{static_cast<float>(x),
+                                                static_cast<float>(y)});
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_move threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* v) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto* root = v->bridge->view();
+        if (!root) return PULP_EMBED_ERR_INVALID_ARG;
+        // Pass an out-of-bounds point so hit_test returns null and any
+        // currently-hovered view clears (matches platform behaviour when
+        // the pointer leaves the window).
+        root->simulate_hover(pulp::view::Point{-1.0f, -1.0f});
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_exit threw");
+    }
+}
+
 PulpEmbedResult pulp_embed_capture_png(PulpEmbedView* v, uint8_t* out,
                                        size_t cap, size_t* out_len) {
     if (!v || !v->host || !out_len) return PULP_EMBED_ERR_INVALID_ARG;
