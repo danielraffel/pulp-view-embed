@@ -80,7 +80,7 @@ jobs:
           # The tarball unpacks to a single top-level pulp-sdk-<version>/ dir;
           # flatten it into PREFIX so CMAKE_PREFIX_PATH points straight at the SDK.
           tar xzf "${RUNNER_TEMP}/pulp-sdk.tar.gz" -C "${RUNNER_TEMP}"
-          inner="$(find "${RUNNER_TEMP}" -maxdepth 1 -type d -name 'pulp-sdk-*' | head -1)"
+          inner="$(find "${RUNNER_TEMP}" -maxdepth 1 -type d -name 'pulp-sdk*' | head -1)"
           if [ -n "${inner}" ]; then
             cp -a "${inner}/." "${PREFIX}/"
           fi
