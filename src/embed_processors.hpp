@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -168,6 +169,50 @@ private:
     }
 
     pulp::view::DesignIR ir_;
+    pulp::format::ViewSize size_;
+};
+
+// Native-view processor: wraps a host-supplied factory that builds a hand-coded
+// pulp::view::View tree (e.g. a DesignFrameView subclass) — no DesignIR, no
+// ui.js. The factory runs once, when ViewBridge calls create_view(). This is the
+// foreign-host "bring your own compiled View" lane: the view's DesignFrameView
+// elements that carry a non-empty param_key bind to host parameters through the
+// SAME string-key↔host bridge the importer lanes use (build_param_bridge reads
+// the keys off the live view rather than a DesignIR). No audio ever runs.
+class EmbedNativeViewProcessor final : public pulp::format::Processor {
+public:
+    using ViewFactory = std::function<std::unique_ptr<pulp::view::View>()>;
+
+    EmbedNativeViewProcessor(ViewFactory factory, pulp::format::ViewSize size)
+        : factory_(std::move(factory)), size_(size) {}
+
+    pulp::format::PluginDescriptor descriptor() const override {
+        pulp::format::PluginDescriptor d;
+        d.name = "PulpEmbed";
+        d.manufacturer = "Pulp";
+        d.bundle_id = "dev.pulp.embed";
+        d.version = "0.1.0";
+        return d;
+    }
+    void define_parameters(pulp::state::StateStore&) override {}
+    void prepare(const pulp::format::PrepareContext&) override {}
+    void process(pulp::audio::BufferView<float>&,
+                 const pulp::audio::BufferView<const float>&,
+                 pulp::midi::MidiBuffer&,
+                 pulp::midi::MidiBuffer&,
+                 const pulp::format::ProcessContext&) override {}
+
+    pulp::format::ViewSize view_size() const override { return size_; }
+
+    // ViewBridge::open() calls this exactly once and owns the result. A null
+    // factory (or one that returns null) yields an empty tree; the create path
+    // reports PULP_EMBED_ERR_MATERIALIZE, same as an empty DesignIR.
+    std::unique_ptr<pulp::view::View> create_view() override {
+        return factory_ ? factory_() : nullptr;
+    }
+
+private:
+    ViewFactory factory_;
     pulp::format::ViewSize size_;
 };
 

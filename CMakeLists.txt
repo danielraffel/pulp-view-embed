@@ -42,8 +42,18 @@ target_include_directories(pulp_view_embed PUBLIC
 
 # Pulp::view carries the materializer + PluginViewHost; the rest are the
 # subsystems the shim names directly. Skia comes transitively via Pulp::render.
+#
+# Pulp::view is PUBLIC because the native-view entry's public header
+# (pulp_view_embed_native.hpp) includes <pulp/view/view.hpp> — a consumer that
+# mounts a compiled View (the JUCE/iPlug2 adapters) must see the Pulp SDK headers
+# to compile it. Pulp::view's interface include dir is the whole SDK include
+# tree, so this one PUBLIC dep puts every pulp header on the consumer's path. The
+# C-ABI-only surface (pulp_view_embed.h) still includes no Pulp header, so a
+# pure-C-ABI consumer is unaffected. The other subsystems stay PRIVATE — their
+# symbols still propagate transitively from this static lib at the final link.
+target_link_libraries(pulp_view_embed PUBLIC Pulp::view)
 target_link_libraries(pulp_view_embed PRIVATE
-    Pulp::format Pulp::view Pulp::state Pulp::canvas Pulp::render)
+    Pulp::format Pulp::state Pulp::canvas Pulp::render)
 
 if(APPLE)
     target_link_libraries(pulp_view_embed PRIVATE "-framework AppKit")
@@ -108,6 +118,7 @@ if(PULP_VIEW_EMBED_SHARED)
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     install(FILES include/pulp_view_embed.h
                   include/pulp_view_embed.hpp
+                  include/pulp_view_embed_native.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
     # Bundle the one non-system runtime dependency (the WebGPU backend dylib)

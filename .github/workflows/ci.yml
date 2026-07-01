@@ -77,11 +77,15 @@ jobs:
             echo "::warning::PULP_SDK_TARBALL_SHA256 not set — skipping checksum verification (a stale SDK can produce invalid CI)."
           fi
           mkdir -p "${PREFIX}"
-          # The tarball unpacks to a single top-level pulp-sdk-<version>/ dir;
-          # flatten it into PREFIX so CMAKE_PREFIX_PATH points straight at the SDK.
+          # The tarball unpacks to a single top-level pulp-sdk*/ dir. The
+          # official release asset uses 'pulp-sdk/' (which, extracted into
+          # RUNNER_TEMP, IS ${PREFIX}); a tools/package-sdk.sh tarball uses
+          # 'pulp-sdk-<version>/'. Flatten only when the inner dir differs from
+          # PREFIX — otherwise the SDK already sits at PREFIX and a self-copy
+          # would error.
           tar xzf "${RUNNER_TEMP}/pulp-sdk.tar.gz" -C "${RUNNER_TEMP}"
-          inner="$(find "${RUNNER_TEMP}" -maxdepth 1 -type d -name 'pulp-sdk-*' | head -1)"
-          if [ -n "${inner}" ]; then
+          inner="$(find "${RUNNER_TEMP}" -maxdepth 1 -type d -name 'pulp-sdk*' | head -1)"
+          if [ -n "${inner}" ] && [ "${inner}" != "${PREFIX}" ]; then
             cp -a "${inner}/." "${PREFIX}/"
           fi
           test -f "${PREFIX}/lib/cmake/Pulp/PulpConfig.cmake" \
