@@ -386,7 +386,7 @@ int main(int argc, const char* argv[]) {
             check(pulp_embed_dispatch_mouse_up(v, 165, 110) == PULP_EMBED_OK,
                   "dispatch_mouse_up(valid) clears capture OK");
 
-            // ── P0.4: size_hints.resizable is DERIVED, not hardcoded ──
+            // ── size_hints.resizable is DERIVED, not hardcoded ──
             // view_size_from_design synthesizes min=preferred*2/3, max=preferred*2,
             // so there is a real resize range and resizable must report 1 — but it
             // is computed from min/max, so it stays honest for a future locked
