@@ -141,6 +141,11 @@ struct HostParamLog {
     double last_set_value = -1.0;
     std::string last_begin_key;
     std::string last_end_key;
+    // ABI v8 host param-surface counters.
+    int has_calls = 0;
+    int display_calls = 0;
+    int action_calls = 0;
+    std::string last_action;
     // Host-side "automation state" keyed by param key (what a DAW would store).
     std::vector<std::pair<std::string, double>> store;
 
@@ -173,6 +178,39 @@ void host_end_gesture(void* ctx, const char* key) {
     auto* log = static_cast<HostParamLog*>(ctx);
     ++log->end_count;
     log->last_end_key = key ? key : "";
+}
+
+// ── ABI v8 host param-surface callbacks ──────────────────────────────────
+// has_param claims membership for any non-empty key; param_display_text formats
+// the normalized value as a percent ("85%") so the snapshot's cached text is
+// deterministic and value-dependent; host_action records the last opaque
+// command. The shim resolves has_param/param_display_text once per tick (and at
+// create) into a local snapshot the getters read — paint never re-enters here.
+int host_has_param(void* ctx, const char* key) {
+    auto* log = static_cast<HostParamLog*>(ctx);
+    ++log->has_calls;
+    return (key && *key) ? 1 : 0;
+}
+size_t host_param_display_text(void* ctx, const char* /*key*/, double norm,
+                               char* buf, size_t cap) {
+    auto* log = static_cast<HostParamLog*>(ctx);
+    ++log->display_calls;
+    char tmp[64];
+    const int len = std::snprintf(tmp, sizeof tmp, "%d%%",
+                                  static_cast<int>(norm * 100.0 + 0.5));
+    if (buf && cap) {
+        const size_t n = static_cast<size_t>(len) < cap - 1
+                             ? static_cast<size_t>(len) : cap - 1;
+        std::memcpy(buf, tmp, n);
+        buf[n] = '\0';
+    }
+    return static_cast<size_t>(len);
+}
+int host_action(void* ctx, const char* action, const char* /*args_json*/) {
+    auto* log = static_cast<HostParamLog*>(ctx);
+    ++log->action_calls;
+    log->last_action = action ? action : "";
+    return 0;  // diagnostic-only; never control flow
 }
 
 // ── M1.9 resolve_resource recorder ───────────────────────────────────────
@@ -322,6 +360,41 @@ int main(int argc, const char* argv[]) {
                   "dispatch_mouse_move(valid, out-of-bounds clears hover) OK");
             check(pulp_embed_dispatch_mouse_exit(v) == PULP_EMBED_OK,
                   "dispatch_mouse_exit(valid) OK");
+
+            // ── host->view press/drag/release dispatch (draggable controls) ──
+            // The down/drag/up trio hit-tests + captures on down, replays against
+            // the captured target on drag/up, and clears on up — the same subset
+            // of the native mouse path a foreign host drives. Assert the ABI
+            // contract on the detached CPU tree: null rejection, a full
+            // down->drag->up gesture in-bounds, and drag/up with no prior down
+            // (no captured target) as harmless no-ops.
+            check(pulp_embed_dispatch_mouse_down(nullptr, 10, 10) ==
+                      PULP_EMBED_ERR_INVALID_ARG,
+                  "dispatch_mouse_down(NULL) rejects");
+            check(pulp_embed_dispatch_mouse_drag(nullptr, 10, 10) ==
+                      PULP_EMBED_ERR_INVALID_ARG,
+                  "dispatch_mouse_drag(NULL) rejects");
+            check(pulp_embed_dispatch_mouse_up(nullptr, 10, 10) ==
+                      PULP_EMBED_ERR_INVALID_ARG,
+                  "dispatch_mouse_up(NULL) rejects");
+            check(pulp_embed_dispatch_mouse_drag(v, 160, 100) == PULP_EMBED_OK,
+                  "dispatch_mouse_drag with no capture is a no-op OK");
+            check(pulp_embed_dispatch_mouse_down(v, 160, 100) == PULP_EMBED_OK,
+                  "dispatch_mouse_down(valid, in-bounds) OK");
+            check(pulp_embed_dispatch_mouse_drag(v, 165, 110) == PULP_EMBED_OK,
+                  "dispatch_mouse_drag(valid) OK");
+            check(pulp_embed_dispatch_mouse_up(v, 165, 110) == PULP_EMBED_OK,
+                  "dispatch_mouse_up(valid) clears capture OK");
+
+            // ── P0.4: size_hints.resizable is DERIVED, not hardcoded ──
+            // view_size_from_design synthesizes min=preferred*2/3, max=preferred*2,
+            // so there is a real resize range and resizable must report 1 — but it
+            // is computed from min/max, so it stays honest for a future locked
+            // design.
+            check(hints.min_width > 0 && hints.max_width > hints.min_width,
+                  "size_hints has a synthesized resize range (min < max)");
+            check(hints.resizable == 1,
+                  "size_hints.resizable derived==1 for a ranged design");
         }
 
         // ── M1.2: attach gate ────────────────────────────────────────────
@@ -498,6 +571,11 @@ int main(int argc, const char* argv[]) {
             pd.host.get_param = host_get_param;
             pd.host.begin_gesture = host_begin_gesture;
             pd.host.end_gesture = host_end_gesture;
+            // ABI v8 tail — exercising these also proves the v8 desc/host-block
+            // growth is accepted (struct_size gating) end to end.
+            pd.host.has_param = host_has_param;
+            pd.host.param_display_text = host_param_display_text;
+            pd.host.host_action = host_action;
 
             PulpEmbedView* pv = nullptr;
             PulpEmbedResult pr =
@@ -600,6 +678,33 @@ int main(int argc, const char* argv[]) {
                     // Unknown-key push is a tolerated no-op.
                     check(pulp_embed_param_changed(pv, "no_such_param", 0.5) == PULP_EMBED_OK,
                           "param_changed(unknown key) is a tolerated no-op");
+
+                    // ── ABI v8: host param-surface snapshot ──
+                    // The shim resolves has_param + param_display_text for every
+                    // param at create (build_param_bridge) into a per-view cache
+                    // the getters read WITHOUT re-entering the host.
+                    check(log.has_calls >= n,
+                          "host.has_param snapshotted at create (calls >= param count)");
+                    check(log.display_calls >= n,
+                          "host.param_display_text snapshotted at create (calls >= param count)");
+                    check(pulp_embed_param_has(pv, "Knob_Small47") == 1,
+                          "param_has(real key) reads cached host membership = 1");
+                    check(pulp_embed_param_has(pv, "no_such_param") == -1,
+                          "param_has(unknown key) = -1 (not a design control)");
+
+                    // Display text refreshes on tick to the current value: push a
+                    // known value, tick to re-snapshot, and assert the cached text
+                    // matches the host's "NN%" formatting of that value.
+                    pulp_embed_param_changed(pv, "Knob_Small47", 0.5);
+                    if (pulp_embed_tick(pv) == PULP_EMBED_OK) {
+                        char disp[64] = {0};
+                        size_t dl = pulp_embed_param_display_text(pv, found_idx, disp, sizeof disp);
+                        std::printf("    v8 display text @0.5 = \"%s\"\n", disp);
+                        check(dl > 0 && std::string(disp) == "50%",
+                              "param_display_text reflects host-formatted value after tick");
+                    } else {
+                        std::printf("    (tick unavailable; skipping display-refresh assert)\n");
+                    }
                 }
 
                 pulp_embed_destroy(pv);
