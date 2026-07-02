@@ -15,7 +15,7 @@ adapter degrades when the runtime library predates a feature.
   (`pulp-embed-juce`, `pulp-embed-iplug2`, a future SDL wrapper) that consumes
   the ABI.
 
-## Coordinated release baseline (Phase D — the accelerator v0.1.0 baseline)
+## Coordinated release baseline (the accelerator v0.1.0 baseline)
 
 The JUCE→Pulp embed stack ships as one coordinated set of pins. These are the
 real shipped values every surface was validated against for the accelerator
