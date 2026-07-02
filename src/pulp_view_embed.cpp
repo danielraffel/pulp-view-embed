@@ -591,6 +591,13 @@ void build_param_bridge(PulpEmbedView* v) {
     auto* root = v->bridge->view();
     if (!root) return;
 
+    // A rebuild (pulp_embed_reload_bundle) frees the old widget tree. Any drag
+    // capture into it must be dropped here, or a subsequent dispatch_mouse_drag/
+    // _up would deref a freed widget (heap-use-after-free in a hot-reload dev
+    // loop). This is the common chokepoint for create AND reload; on first
+    // create drag_target is already null, so clearing it is a harmless no-op.
+    v->drag_target = nullptr;
+
     // Reload-safe: a rebuild (pulp_embed_reload_bundle) must reuse the StateStore
     // params that already exist for a key — the store has no remove API, and the
     // host binds by key. Snapshot key->param_id, drop the old widget bindings +
