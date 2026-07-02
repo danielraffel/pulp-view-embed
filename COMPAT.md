@@ -12,7 +12,35 @@ adapter degrades when the runtime library predates a feature.
   the number a runtime library reports from `pulp_embed_abi_version()`. This is
   the ONLY version a foreign host must reason about at runtime.
 - **Adapter tag** — the git tag / release of a downstream host adapter
-  (`pulp-embed-juce`, a future iPlug2/SDL wrapper) that consumes the ABI.
+  (`pulp-embed-juce`, `pulp-embed-iplug2`, a future SDL wrapper) that consumes
+  the ABI.
+
+## Coordinated release baseline (Phase D — the accelerator v0.1.0 baseline)
+
+The JUCE→Pulp embed stack ships as one coordinated set of pins. These are the
+real shipped values every surface was validated against for the accelerator
+baseline. The `pulp-embed-juce-template` pins its FetchContent refs to exactly
+these adapter tags.
+
+| Surface | Shipped value | Notes |
+|---------|---------------|-------|
+| Pulp SDK | v0.550.0 | Latest published SDK release. Ships a `find_package`-able `pulp-sdk-<platform>.tar.gz` (e.g. `pulp-sdk-darwin-arm64.tar.gz`, carrying `lib/cmake/Pulp/PulpConfig.cmake` + `libpulp-*.a`). The shim is built against the Pulp SDK; a foreign host linking the prebuilt dylib never sees this version. |
+| Embed ABI | v8 | `PULP_VIEW_EMBED_ABI_VERSION` in `include/pulp_view_embed.h`; the number `pulp_embed_abi_version()` reports. |
+| pulp-view-embed | v0.1.0 | This repo — the shim that provides embed ABI v8. |
+| pulp-embed-juce | v0.1.0 | JUCE host adapter. |
+| pulp-embed-iplug2 | v0.1.0 | iPlug2 host adapter (parity with the JUCE adapter). |
+
+> The SDK `pulp-sdk-<platform>.tar.gz` is a **static-lib developer SDK** (headers
+> + `libpulp-*.a` + CMake config), not a code-signed/notarized app bundle. Code
+> signing and notarization happen when a consumer packages *their own* plugin,
+> not on this SDK archive. A fully turnkey signed end-user distributable is the
+> SDK release pipeline's job, and is not required to build against the SDK.
+> The import-side tools (`pulp-import-juce` / `pulp-import-iplug`, both v0.1.0)
+> emit projects that consume these same adapters.
+
+The version-skew rule below (an adapter clamps `abi_version` to
+`min(header, runtime)`) is what lets any of these pins move independently within
+the documented bounds without breaking the seam.
 
 ## Matrix
 
