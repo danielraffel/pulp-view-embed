@@ -59,8 +59,8 @@ target_link_libraries(my_target PRIVATE pulp_view_embed)
 
 `-DPULP_VIEW_EMBED_SHARED=ON` builds `libpulp_view_embed.dylib`, which statically
 links the entire Pulp C++ runtime (Skia, Dawn, Abseil, …) and **exports only the
-26 `pulp_embed_*` C ABI symbols**. A foreign host links it with no Pulp build and
-no exposure to Pulp's C++ symbols.
+42 `pulp_embed_*` C ABI symbols** (ABI v8). A foreign host links it with no Pulp
+build and no exposure to Pulp's C++ symbols.
 
 ### Build + install the dist
 
@@ -104,8 +104,8 @@ via `@loader_path`.
 ### Symbol-surface / linkage proof
 
 ```bash
-# Exactly the 26 pulp_embed_* symbols, nothing else:
-nm -gU dist/lib/libpulp_view_embed.dylib | wc -l          # 26
+# Exactly the pulp_embed_* symbols, nothing else (42 at ABI v8):
+nm -gU dist/lib/libpulp_view_embed.dylib | wc -l          # 42
 nm -gU dist/lib/libpulp_view_embed.dylib | grep -v ' _pulp_embed_'   # (empty)
 nm -gU dist/lib/libpulp_view_embed.dylib | c++filt | grep -c 'pulp::' # 0
 
@@ -196,9 +196,60 @@ cmake --build build -j
 ctest --test-dir build -R embed-smoke --output-on-failure
 ```
 
-No Pulp checkout, no branch build. The clean-room build of pulp-view-embed
-against an untarred tarball produces the same 26-symbol dylib and passes
+No Pulp checkout, no branch build. A from-scratch build of pulp-view-embed
+against an untarred tarball produces the same 42-symbol dylib and passes
 `embed-smoke`.
+
+---
+
+## 4. Release flow — signed + notarized prebuilt embed tarball
+
+The **primary foreign-host deliverable** (distinct from the §3 *SDK* tarball,
+which is a build input) is a single tarball carrying the prebuilt, signed +
+notarized `libpulp_view_embed.dylib`, its bundled `libwgpu_native.dylib`, the C
+header, and the `find_package` config — so a JUCE/iPlug2 host consumes the embed
+with **no Pulp SDK, no Pulp source, and no build of this repo**. Recipe only;
+signing steps need an Apple Developer ID and are not run here.
+
+```bash
+# 1. Build + install the dist (against an installed SDK — §3 tarball or a build).
+cmake -S . -B build-shared -DCMAKE_BUILD_TYPE=Release \
+      -DPULP_VIEW_EMBED_SHARED=ON -DCMAKE_PREFIX_PATH=/path/to/pulp-sdk
+cmake --build build-shared -j
+cmake --install build-shared --prefix dist/pulp-view-embed-<version>
+
+# 2. Verify the ABI surface BEFORE signing (catch a missing .exp entry early).
+nm -gU dist/pulp-view-embed-<version>/lib/libpulp_view_embed.dylib | wc -l   # 42 @ v8
+test "$(pulp_embed_abi_version_from_header)" = 8   # header/define sanity
+
+# 3. Sign every Mach-O in the dist (hardened runtime + secure timestamp).
+for m in libpulp_view_embed.dylib libwgpu_native.dylib; do
+  codesign --force --timestamp --options runtime \
+    --sign "Developer ID Application: YOUR NAME (TEAMID)" \
+    dist/pulp-view-embed-<version>/lib/$m
+done
+
+# 4. Zip the dist (notarytool cannot take a bare .dylib), submit, wait, staple
+#    the container (a loose .dylib has nowhere to staple — ship the .zip/.dmg).
+ditto -c -k --keepParent dist/pulp-view-embed-<version> \
+      dist/pulp-view-embed-<version>.zip
+xcrun notarytool submit dist/pulp-view-embed-<version>.zip \
+  --key AuthKey_XXXX.p8 --key-id KID --issuer ISS --wait
+#   (staple the .dmg/.pkg you ultimately distribute; then:)
+codesign --verify --strict --verbose=2 \
+  dist/pulp-view-embed-<version>/lib/libpulp_view_embed.dylib
+spctl --assess --type exec --verbose \
+  dist/pulp-view-embed-<version>/lib/libpulp_view_embed.dylib
+
+# 5. Publish the .zip as a GitHub release asset for the matching git tag; record
+#    its sha256 alongside the SDK×ABI×adapter row in COMPAT.md.
+shasum -a 256 dist/pulp-view-embed-<version>.zip
+```
+
+Version skew and the SDK×ABI×adapter matrix this release must satisfy live in
+[COMPAT.md](COMPAT.md). Bump `project(... VERSION ...)` in `CMakeLists.txt` and
+`pulp-package.json` for a release; the ABI version in `pulp_view_embed.h`
+(`PULP_VIEW_EMBED_ABI_VERSION`) is independent and only bumps on an ABI change.
 
 ---
 

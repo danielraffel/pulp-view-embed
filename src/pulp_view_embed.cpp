@@ -22,6 +22,7 @@
 #include <pulp/view/text_editor.hpp>
 #include <pulp/view/design_import.hpp>
 #include <pulp/view/design_ir.hpp>
+#include <pulp/view/inspector.hpp>   // ViewInspector::absolute_bounds (drag coords)
 #include <pulp/view/plugin_view_host.hpp>
 #include <pulp/view/screenshot.hpp>
 #include <pulp/view/scripted_ui.hpp>
@@ -111,6 +112,10 @@ struct PulpEmbedView {
     bool offscreen = false;  // created via pulp_embed_create_offscreen (no host)
     std::string last_error;
 
+    // Widget captured at dispatch_mouse_down; drag/up replay against it until
+    // up clears it (borrowed pointer, owned by the view tree).
+    pulp::view::View* drag_target = nullptr;
+
     // ── host resource staging (ABI v3) ──
     // Temp dir holding host-served asset bytes (resolve_resource), written so the
     // existing on-disk render path loads them. Removed in destroy(). Empty when
@@ -144,6 +149,15 @@ struct PulpEmbedView {
     // after asset-path resolution. Computed once at create; an authoritative
     // replacement for a consumer string-scanning the DesignIR JSON itself.
     std::vector<std::string> missing_assets;
+
+    // ── host param-surface snapshot (ABI v8) ──
+    // Snapshotted ONCE PER TICK (and at create/reload) from host.has_param /
+    // host.param_display_text so the embedded view's paint path never calls back
+    // into the host. Both are indexed parallel to `params`. has: -1 unknown (no
+    // host has_param callback), else 0/1 membership. display: the host's
+    // formatted value string ("500 ms"), empty when the host serves none.
+    std::vector<int8_t>      param_has_snapshot;
+    std::vector<std::string> param_display_snapshot;
 
     // Thread that created the view. pulp_embed_reload_bundle (which rebuilds views
     // + touches the GPU surface) must run here; a call from another thread is
@@ -197,6 +211,7 @@ void build_param_bridge(PulpEmbedView* v);
 void build_string_bridge(PulpEmbedView* v);
 void collect_missing_render_assets(PulpEmbedView* v);
 void poll_host_meters(PulpEmbedView* v);
+void snapshot_host_param_surface(PulpEmbedView* v);
 
 // ── host resource staging (resolve_resource, ABI v3) ───────────────────────
 //
@@ -576,6 +591,13 @@ void build_param_bridge(PulpEmbedView* v) {
     auto* root = v->bridge->view();
     if (!root) return;
 
+    // A rebuild (pulp_embed_reload_bundle) frees the old widget tree. Any drag
+    // capture into it must be dropped here, or a subsequent dispatch_mouse_drag/
+    // _up would deref a freed widget (heap-use-after-free in a hot-reload dev
+    // loop). This is the common chokepoint for create AND reload; on first
+    // create drag_target is already null, so clearing it is a harmless no-op.
+    v->drag_target = nullptr;
+
     // Reload-safe: a rebuild (pulp_embed_reload_bundle) must reuse the StateStore
     // params that already exist for a key — the store has no remove API, and the
     // host binds by key. Snapshot key->param_id, drop the old widget bindings +
@@ -770,6 +792,26 @@ void build_param_bridge(PulpEmbedView* v) {
 
     // ABI v6: text_field string bridge (separate from the numeric params above).
     build_string_bridge(v);
+
+    // ABI v8: seed the host param-surface snapshot (has_param / param_display_text)
+    // so the getters are populated before the first tick. Refreshed each tick.
+    snapshot_host_param_surface(v);
+
+    // ABI v8, host_action (view->host): captured in host_cb via capture_host_
+    // callbacks. It is fired when the embedded design activates an ACTION-kind
+    // control (a button/menu command that is not a normalized param — the
+    // native-lane switch above intentionally skips momentary/swap/action/
+    // value_label/custom as "no host param"). The faithful/native DesignFrameView
+    // does not yet expose a per-element action callback, so there is no live
+    // trigger to route today; the moment it gains one (e.g. on_element_action),
+    // forward it here as:
+    //   frame->on_element_action = [self](int idx){
+    //       if (self->host_cb.host_action)
+    //           self->host_cb.host_action(self->host_ctx,
+    //                                     self->params_action_name(idx), nullptr);
+    //   };
+    // The callback is captured and ABI-stable now so hosts can wire it ahead of
+    // that view-side surface (int return is diagnostic-only; must not block).
 }
 
 // Build the text-field string bridge (ABI v6): discover bindable text_field
@@ -854,6 +896,46 @@ void poll_host_meters(PulpEmbedView* v) {
     // No meter widgets in the current importer JS bundle surface. When the
     // scripted bundle gains createMeter bindings, route `levels` through the
     // session's AudioBridge here.
+}
+
+// Snapshot the host param surface (ABI v8) into local state. Called at create /
+// reload (from build_param_bridge) and every tick. The embedded view's paint
+// path reads the cache (pulp_embed_param_has / pulp_embed_param_display_text) —
+// it MUST NOT re-enter the host per frame, so the one host round-trip happens
+// here, at tick, not in paint. Sizing is always kept in lockstep with `params`
+// so the getters index safely even when no v8 callback is wired (all -1/empty).
+void snapshot_host_param_surface(PulpEmbedView* v) {
+    if (!v) return;
+    const size_t n = v->params.size();
+    v->param_has_snapshot.assign(n, static_cast<int8_t>(-1));
+    v->param_display_snapshot.assign(n, std::string());
+    if (!v->host_cb.has_param && !v->host_cb.param_display_text) return;
+    for (size_t i = 0; i < n; ++i) {
+        const auto& b = v->params[i];
+        if (v->host_cb.has_param)
+            v->param_has_snapshot[i] = static_cast<int8_t>(
+                v->host_cb.has_param(v->host_ctx, b.key.c_str()) ? 1 : 0);
+        if (v->host_cb.param_display_text) {
+            const double norm =
+                v->store ? static_cast<double>(v->store->get_normalized(b.param_id))
+                         : 0.0;
+            char buf[256];
+            size_t len = v->host_cb.param_display_text(v->host_ctx, b.key.c_str(),
+                                                       norm, buf, sizeof buf);
+            if (len == 0) continue;                 // no display text for this key
+            if (len < sizeof buf) {
+                v->param_display_snapshot[i].assign(buf, len);
+            } else {
+                // Host reports a string longer than our stack buffer — re-query
+                // with an exact-sized heap buffer (two-call sizing contract).
+                std::string big(len + 1, '\0');
+                size_t got = v->host_cb.param_display_text(
+                    v->host_ctx, b.key.c_str(), norm, big.data(), big.size());
+                if (got > len) got = len;
+                v->param_display_snapshot[i].assign(big.data(), got);
+            }
+        }
+    }
 }
 
 // Shared create path for the high-fidelity scripted-UI bundle. bundle_dir must
@@ -1214,6 +1296,10 @@ PulpEmbedResult pulp_embed_tick(PulpEmbedView* v) {
         // event-driven via DesignFrameView::on_element_changed, not polled here.)
         if (v->store) v->store->pump_listeners();
         poll_host_meters(v);
+        // ABI v8: refresh the host param-surface snapshot (membership + display
+        // text) ONCE here so the subsequent repaint reads cached state and never
+        // re-enters the host from paint.
+        snapshot_host_param_surface(v);
         v->host->repaint();
         return PULP_EMBED_OK;
     } catch (...) {
@@ -1273,7 +1359,18 @@ PulpEmbedResult pulp_embed_size_hints(PulpEmbedView* v, PulpEmbedSizeHints* out)
     out->max_width = static_cast<int32_t>(s.max_width);
     out->max_height = static_cast<int32_t>(s.max_height);
     out->aspect_ratio = static_cast<float>(s.aspect_ratio);
-    out->resizable = 1;
+    // Derived honestly from the synthesized min/max: resizable iff there is
+    // any room to resize — an unbounded max (0), or max strictly greater than min
+    // in either axis. A locked design (min == max in both axes) reports 0. Today
+    // view_size_from_design synthesizes min = preferred*2/3, max = preferred*2, so
+    // this is effectively always 1; it is computed rather than hardcoded so a
+    // future fixed-size design honestly reports 0. (Design-DECLARED min/max/
+    // resizable, when the importer carries it, needs a versioned
+    // pulp_embed_size_hints2() — this struct has no struct_size and cannot grow;
+    // see the PulpEmbedSizeHints header doc.)
+    const bool w_range = (s.max_width == 0) || (s.max_width > s.min_width);
+    const bool h_range = (s.max_height == 0) || (s.max_height > s.min_height);
+    out->resizable = (w_range || h_range) ? 1 : 0;
     return PULP_EMBED_OK;
 }
 
@@ -1350,6 +1447,28 @@ PulpEmbedResult pulp_embed_param_info(PulpEmbedView* v, int32_t index,
     out->step_count = b.is_discrete ? b.option_count : 0;
     out->has_meta = b.name.empty() ? 0 : 1;
     return PULP_EMBED_OK;
+}
+
+// ── host param-surface snapshot getters (ABI v8) ───────────────────────────
+// Both read the per-tick snapshot (snapshot_host_param_surface); neither calls
+// back into the host, so they are safe from a paint/layout path.
+
+int32_t pulp_embed_param_has(PulpEmbedView* v, const char* key) {
+    if (!v || !key) return -1;
+    auto it = v->key_to_index.find(key);
+    if (it == v->key_to_index.end()) return -1;          // not a design control
+    if (it->second >= v->param_has_snapshot.size()) return -1;
+    return static_cast<int32_t>(v->param_has_snapshot[it->second]);  // -1 / 0 / 1
+}
+
+size_t pulp_embed_param_display_text(PulpEmbedView* v, int32_t index,
+                                     char* buf, size_t cap) {
+    if (!v || index < 0 ||
+        static_cast<size_t>(index) >= v->param_display_snapshot.size()) {
+        if (buf && cap) buf[0] = '\0';
+        return 0;
+    }
+    return copy_str(v->param_display_snapshot[static_cast<size_t>(index)], buf, cap);
 }
 
 PulpEmbedResult pulp_embed_simulate_param_drag(PulpEmbedView* v, int32_t index, double target) {
@@ -1543,6 +1662,67 @@ PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* v) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
     } catch (...) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_exit threw");
+    }
+}
+
+// Press / drag / release. hit_test the root at the (root-space) point, then
+// dispatch to the target widget in ITS local coords (root point minus the
+// widget's absolute origin). down captures the target on the view; drag/up
+// replay against it. This is the minimal subset of the native plugin-view-host
+// mouse path (no focus/bubbling) — enough to make knobs/faders/buttons drag.
+static pulp::view::Point local_for(pulp::view::View* target, double x, double y) {
+    const auto ab = pulp::view::ViewInspector::absolute_bounds(*target);
+    return pulp::view::Point{static_cast<float>(x) - ab.x, static_cast<float>(y) - ab.y};
+}
+
+PulpEmbedResult pulp_embed_dispatch_mouse_down(PulpEmbedView* v, double x, double y) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto* root = v->bridge->view();
+        if (!root) return PULP_EMBED_ERR_INVALID_ARG;
+        v->drag_target = root->hit_test(pulp::view::Point{static_cast<float>(x),
+                                                          static_cast<float>(y)});
+        if (v->drag_target) {
+            v->drag_target->on_mouse_down(local_for(v->drag_target, x, y));
+            if (v->host) v->host->repaint();
+        }
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_down threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_dispatch_mouse_drag(PulpEmbedView* v, double x, double y) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        if (!v->drag_target) return PULP_EMBED_OK;
+        v->drag_target->on_mouse_drag(local_for(v->drag_target, x, y));
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_drag threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_dispatch_mouse_up(PulpEmbedView* v, double x, double y) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        if (v->drag_target) {
+            v->drag_target->on_mouse_up(local_for(v->drag_target, x, y));
+            if (v->host) v->host->repaint();
+        }
+        v->drag_target = nullptr;
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        v->drag_target = nullptr;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        v->drag_target = nullptr;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_up threw");
     }
 }
 
