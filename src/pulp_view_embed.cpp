@@ -1359,7 +1359,7 @@ PulpEmbedResult pulp_embed_size_hints(PulpEmbedView* v, PulpEmbedSizeHints* out)
     out->max_width = static_cast<int32_t>(s.max_width);
     out->max_height = static_cast<int32_t>(s.max_height);
     out->aspect_ratio = static_cast<float>(s.aspect_ratio);
-    // Derived honestly from the synthesized min/max (P0.4): resizable iff there is
+    // Derived honestly from the synthesized min/max: resizable iff there is
     // any room to resize — an unbounded max (0), or max strictly greater than min
     // in either axis. A locked design (min == max in both axes) reports 0. Today
     // view_size_from_design synthesizes min = preferred*2/3, max = preferred*2, so

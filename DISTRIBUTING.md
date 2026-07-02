@@ -196,7 +196,7 @@ cmake --build build -j
 ctest --test-dir build -R embed-smoke --output-on-failure
 ```
 
-No Pulp checkout, no branch build. The clean-room build of pulp-view-embed
+No Pulp checkout, no branch build. A from-scratch build of pulp-view-embed
 against an untarred tarball produces the same 42-symbol dylib and passes
 `embed-smoke`.
 

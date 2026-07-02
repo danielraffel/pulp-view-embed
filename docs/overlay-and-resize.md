@@ -1,10 +1,10 @@
 # Overlay & resize (foreign-host embedding)
 
 How the Pulp-owned child view coexists with a foreign host's own UI (JUCE,
-iPlug2, a bespoke shell) and how to resize it correctly. This is P0.6 of the
-JUCE-port accelerator: the two things that most often surprise a host author
-are **z-order** (what can draw on top of the embed) and **resize** (who owns the
-window geometry and who owns the letterbox math).
+iPlug2, a bespoke shell) and how to resize it correctly. The two things that
+most often surprise a host author are **z-order** (what can draw on top of the
+embed) and **resize** (who owns the window geometry and who owns the letterbox
+math).
 
 Verified on macOS (arm64). The z-order section is AppKit-specific; the resize
 recipe is platform-independent (the letterbox math lives in Pulp).
