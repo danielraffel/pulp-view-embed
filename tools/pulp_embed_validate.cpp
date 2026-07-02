@@ -192,6 +192,32 @@ int main(int argc, char** argv) {
              std::to_string(discrete) + " discrete");
     }
 
+    // Per-control host param-surface snapshot (ABI v8). The preflight wires no
+    // host callbacks (no host_ctx), so has_param reads back "unknown" (-1) and
+    // display text is empty here — this section verifies the v8 getters are wired
+    // and enumerate correctly, and reports whatever a host-backed run would show.
+    // (A real host that supplies has_param / param_display_text sees live
+    // membership + formatted values in this same shape.)
+    {
+        int with_display = 0;
+        for (int i = 0; i < n; ++i) {
+            char key[256] = {0};
+            pulp_embed_param_key(v, i, key, sizeof key);
+            const int32_t has = pulp_embed_param_has(v, key);
+            char disp[128] = {0};
+            const size_t dlen = pulp_embed_param_display_text(v, i, disp, sizeof disp);
+            if (dlen > 0) ++with_display;
+            char line[420];
+            std::snprintf(line, sizeof line, "  %-22s has=%s display=%s", key,
+                          has < 0 ? "unknown" : (has ? "yes" : "no"),
+                          dlen > 0 ? disp : "(none)");
+            info(line);
+        }
+        info("v8 host param surface: " + std::to_string(with_display) +
+             "/" + std::to_string(n) + " controls carry host display text "
+             "(0 expected without a wired host)");
+    }
+
     // ── 3) asset resolution (the placeholder-render trap) ───────────────────
     // Check the assets the RENDER actually consumes, not every manifest entry.
     // DesignIR: faithful frames render `svg_asset_id`; fonts reference an

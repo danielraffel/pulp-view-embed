@@ -56,7 +56,26 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 7u
+#define PULP_VIEW_EMBED_ABI_VERSION 8u
+
+/* v8 (2026-07): dynamic-UI host surface. Appends THREE callbacks to the END of
+ * PulpEmbedHostCallbacks (after get_string), struct_size-gated exactly like the
+ * v3/v6 tails, so v1..v7 callers' smaller desc stops before them (read as NULL):
+ *   (1) has_param          — the host's LIVE membership answer for a key (the
+ *                            single source of truth for "is this param bound").
+ *   (2) param_display_text — the host's formatted value string ("500 ms"), so
+ *                            the embed shows host-authored units, not its own.
+ *   (3) host_action        — an opaque view->host command (button/menu action);
+ *                            its int return is diagnostic-only, never control
+ *                            flow, and it must not block.
+ * has_param + param_display_text are host->view and are consumed through a
+ * per-tick SNAPSHOT: the shim resolves them for every keyed control once per
+ * pulp_embed_tick into local state, and the embedded view / a host reads that
+ * cache via pulp_embed_param_has() + pulp_embed_param_display_text(). Paint
+ * NEVER calls back into the host. host_action is view->host (fired by the embed
+ * when a design action control is activated); it needs no dispatch entry point.
+ * The host-block growth is struct_size-gated; the two query functions are new
+ * additive functions, so v7 callers keep working unchanged. */
 
 /* v7 (2026-06): missing-asset diagnostics. Adds pulp_embed_missing_asset_count()
  * + pulp_embed_missing_asset() so a host preflight can ask the materialized view
@@ -181,6 +200,34 @@ typedef void    (*PulpEmbedSetStringFn)(void* host_ctx, const char* key, const c
 typedef int32_t (*PulpEmbedGetStringFn)(void* host_ctx, const char* key,
                                         char* out, int32_t cap);
 
+/* Dynamic-UI host surface (ABI v8).
+ *
+ * has_param: the host's LIVE answer for whether `key` is a bound parameter right
+ * now — the single source of truth, so the embed does not guess membership from
+ * the design alone. Returns non-zero if the host currently has this param.
+ *
+ * param_display_text: the host formats `normalized` [0,1] into a human string
+ * for `key` (e.g. "500 ms", "-6.0 dB", "Sine") and writes up to `cap` bytes
+ * (incl NUL) into `buf`, returning the full length EXCLUDING the NUL (two-call
+ * sizing, like the other string getters). Return 0 for "no display text".
+ *
+ * host_action: the embed fires an opaque command at the host (a design button /
+ * menu action), passing an `action` name and optional `args_json` (may be NULL).
+ * The int return is DIAGNOSTIC-ONLY (log/telemetry) — never treat it as control
+ * flow — and the callback MUST NOT block (it runs on the host UI thread inline
+ * with the gesture).
+ *
+ * has_param + param_display_text are host->view and are read through a per-tick
+ * snapshot (see pulp_embed_param_has / pulp_embed_param_display_text); the shim
+ * resolves them once per pulp_embed_tick so paint never re-enters the host. All
+ * three are optional (NULL slot disables). */
+typedef int    (*PulpEmbedHasParamFn)(void* host_ctx, const char* key);
+typedef size_t (*PulpEmbedParamDisplayTextFn)(void* host_ctx, const char* key,
+                                              double normalized,
+                                              char* buf, size_t cap);
+typedef int    (*PulpEmbedHostActionFn)(void* host_ctx, const char* action,
+                                        const char* args_json);
+
 typedef struct PulpEmbedHostCallbacks {
     PulpEmbedSetParamFn   set_param;     /* UI gesture -> host param write      */
     PulpEmbedGetParamFn   get_param;     /* host -> view initial-value pull     */
@@ -193,6 +240,10 @@ typedef struct PulpEmbedHostCallbacks {
     /* ABI v6 tail — struct_size-gated (v1..v5 callers stop before this). */
     PulpEmbedSetStringFn set_string; /* UI text edit -> host string state       */
     PulpEmbedGetStringFn get_string; /* host -> view initial text (preset recall)*/
+    /* ABI v8 tail — struct_size-gated (v1..v7 callers stop before this). */
+    PulpEmbedHasParamFn         has_param;          /* live membership (auth.)   */
+    PulpEmbedParamDisplayTextFn param_display_text; /* formatted value string    */
+    PulpEmbedHostActionFn       host_action;        /* opaque view->host command */
 } PulpEmbedHostCallbacks;
 
 /* Creation descriptor. Zero-initialize, then set struct_size = sizeof(*desc),
@@ -215,7 +266,23 @@ typedef struct PulpEmbedDesc {
     PulpEmbedHostCallbacks host; /* host parameter/meter callbacks; all opt.  */
 } PulpEmbedDesc;
 
-/* Resize constraints derived from the imported design (pulp_embed_size_hints). */
+/* Resize constraints derived from the imported design (pulp_embed_size_hints).
+ *
+ * NOTE: this struct has NO struct_size and therefore CANNOT grow — its layout is
+ * frozen. If a future need arises for design-DECLARED min/max/resizable (as
+ * opposed to the values synthesized below), it must ship as a NEW, versioned
+ * entry point (e.g. pulp_embed_size_hints2 with its own sized-out struct), not by
+ * adding a field here.
+ *
+ * `resizable` is DERIVED, not asserted: the shim reports 1 when the synthesized
+ * min/max leave any room to resize (max unbounded, or max > min in either axis)
+ * and 0 for a locked design (min == max in both axes). Today the hints come from
+ * pulp::format::view_size_from_design, which synthesizes min = preferred*2/3 and
+ * max = preferred*2, so there is always a resize range and `resizable` is
+ * effectively always 1 — but it is computed from the actual min/max so a future
+ * fixed-size design (min == max) would honestly report 0. The importer does not
+ * yet carry a design-declared min/max/resizable; when it does it will arrive via
+ * the pulp_embed_size_hints2() path described above, not by faking this field. */
 typedef struct PulpEmbedSizeHints {
     int32_t preferred_width;
     int32_t preferred_height;
@@ -224,7 +291,7 @@ typedef struct PulpEmbedSizeHints {
     int32_t max_width;     /* 0 = unbounded */
     int32_t max_height;    /* 0 = unbounded */
     float   aspect_ratio;  /* 0 = unconstrained */
-    int32_t resizable;     /* 0/1 */
+    int32_t resizable;     /* 0/1 — derived from min/max, see struct doc above */
 } PulpEmbedSizeHints;
 
 /* ---- library ---------------------------------------------------------- */
@@ -476,6 +543,24 @@ typedef struct PulpEmbedParamInfo {
 
 PulpEmbedResult pulp_embed_param_info(PulpEmbedView* view, int32_t index,
                                       PulpEmbedParamInfo* out);
+
+/* Host param-surface snapshot (ABI v8). These read the per-tick SNAPSHOT the
+ * shim takes from host.has_param / host.param_display_text — they never call
+ * back into the host, so they are safe to call from a paint/layout path. The
+ * snapshot is refreshed at create and on every pulp_embed_tick.
+ *
+ * pulp_embed_param_has: the host's live membership answer for `key`, as of the
+ * last snapshot: 1 = bound, 0 = not bound, -1 = unknown (no host has_param
+ * callback, or `key` is not a design control). A host that wires has_param gets
+ * the authoritative bound/unbound state without re-entering itself per frame.
+ *
+ * pulp_embed_param_display_text: copy the cached formatted value string for the
+ * parameter at `index` ("500 ms", "-6 dB") into buf (NUL-terminated, truncated
+ * to cap). Returns the full length excluding the NUL, or 0 for an out-of-range
+ * index / NULL view / a host that supplies no param_display_text. */
+int32_t pulp_embed_param_has(PulpEmbedView* view, const char* key);
+size_t  pulp_embed_param_display_text(PulpEmbedView* view, int32_t index,
+                                      char* buf, size_t cap);
 
 /* Host -> view: push a NORMALIZED [0,1] value for the parameter identified by
  * `key` (host automation, preset recall, get_param sync). Updates the embed's
