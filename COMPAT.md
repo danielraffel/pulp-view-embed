@@ -51,7 +51,7 @@ the documented bounds without breaking the seam.
 | v5 | 0.1.0 | Pulp ≥ 0.332.1 | juce v0.1 | `param_info` metadata |
 | v6 | 0.1.0 | Pulp ≥ 0.332.1 | juce v0.1 | text-field string bridge |
 | v7 | 0.1.0 | Pulp ≥ 0.332.1 | juce v0.1 | missing-asset diagnostics |
-| v8 | 0.1.0 (this release) | Pulp (embed-seam build) | juce (dynamic-UI) | `has_param` / `param_display_text` snapshot, `host_action`; `dispatch_mouse_down/_drag/_up` |
+| v8 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (dynamic-UI) | `has_param` / `param_display_text` snapshot, `host_action`; `dispatch_mouse_down/_drag/_up` |
 
 > The "Shim built vs SDK" column is the SDK the shim needs at **build time**; a
 > foreign host linking the prebuilt dylib never sees it. `pulp-package.json`'s
