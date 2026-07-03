@@ -25,8 +25,8 @@ these adapter tags.
 | Surface | Shipped value | Notes |
 |---------|---------------|-------|
 | Pulp SDK | v0.550.0 | Latest published SDK release. Ships a `find_package`-able `pulp-sdk-<platform>.tar.gz` (e.g. `pulp-sdk-darwin-arm64.tar.gz`, carrying `lib/cmake/Pulp/PulpConfig.cmake` + `libpulp-*.a`). The shim is built against the Pulp SDK; a foreign host linking the prebuilt dylib never sees this version. |
-| Embed ABI | v8 | `PULP_VIEW_EMBED_ABI_VERSION` in `include/pulp_view_embed.h`; the number `pulp_embed_abi_version()` reports. |
-| pulp-view-embed | v0.1.0 | This repo — the shim that provides embed ABI v8. |
+| Embed ABI | v9 | `PULP_VIEW_EMBED_ABI_VERSION` in `include/pulp_view_embed.h`; the number `pulp_embed_abi_version()` reports. |
+| pulp-view-embed | v0.1.0 | This repo — the shim that provides embed ABI v9. |
 | pulp-embed-juce | v0.1.0 | JUCE host adapter. |
 | pulp-embed-iplug2 | v0.1.0 | iPlug2 host adapter (parity with the JUCE adapter). |
 
@@ -52,6 +52,7 @@ the documented bounds without breaking the seam.
 | v6 | 0.1.0 | Pulp ≥ 0.332.1 | juce v0.1 | text-field string bridge |
 | v7 | 0.1.0 | Pulp ≥ 0.332.1 | juce v0.1 | missing-asset diagnostics |
 | v8 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (dynamic-UI) | `has_param` / `param_display_text` snapshot, `host_action`; `dispatch_mouse_down/_drag/_up` |
+| v9 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (idle-gate) | `pulp_embed_set_dirty_gate` — opt-in idle repaint gate (default OFF; uses `needs_continuous_frames` when the SDK exports it, else a frame-clock/layout fallback) |
 
 > The "Shim built vs SDK" column is the SDK the shim needs at **build time**; a
 > foreign host linking the prebuilt dylib never sees it. `pulp-package.json`'s

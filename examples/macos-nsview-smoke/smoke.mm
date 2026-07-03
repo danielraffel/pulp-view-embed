@@ -413,6 +413,15 @@ int main(int argc, const char* argv[]) {
             check(pulp_embed_resize(v, 360, 220, 1.0f) == PULP_EMBED_OK, "resize OK");
             check(pulp_embed_tick(v) == PULP_EMBED_OK, "tick OK");
 
+            // ── dirty gate (ABI v8): opt-in toggle + tick stays live ─────
+            check(pulp_embed_set_dirty_gate(nullptr, 1) == PULP_EMBED_ERR_INVALID_ARG,
+                  "set_dirty_gate(NULL) -> INVALID_ARG");
+            check(pulp_embed_set_dirty_gate(v, 1) == PULP_EMBED_OK,
+                  "set_dirty_gate(on) -> OK");
+            check(pulp_embed_tick(v) == PULP_EMBED_OK, "gated tick OK");
+            check(pulp_embed_set_dirty_gate(v, 0) == PULP_EMBED_OK,
+                  "set_dirty_gate(off) -> OK");
+
             pump(15);  // let the GPU display-link draw a few frames
 
             // ── M1.3: GPU capture (GPU-only) ─────────────────────────────

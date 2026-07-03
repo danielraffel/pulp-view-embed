@@ -106,8 +106,8 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(sysctl -n hw.ncpu)"
 
-      - name: Test (embed-smoke, headless/CPU)
-        run: ctest --test-dir build -R embed-smoke --output-on-failure
+      - name: Test (embed-smoke + frame-gate, headless/CPU)
+        run: ctest --test-dir build -R 'embed-smoke|embed-frame-gate' --output-on-failure
 
       - name: Upload render artifacts + ctest logs
         if: always()

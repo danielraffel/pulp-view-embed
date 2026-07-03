@@ -364,6 +364,32 @@ the high-fidelity bundle render, the bidirectional parameter bridge, the
 resolve_resource host callback (same-bytes parity + different-bytes control),
 and the offscreen render mode (matches the windowed render).
 
+### Idle repaint gate (ABI v9)
+
+`pulp_embed_tick()` repaints every call by default (the historical behaviour).
+A host on a 30 Hz timer therefore repaints 30×/s even when nothing on screen is
+moving. `pulp_embed_set_dirty_gate(view, 1)` opts into a smarter tick: it repaints
+only when the view is actually animating, so a silent editor idles to 0 fps.
+
+```c
+pulp_embed_set_dirty_gate(view, 1);   // opt in; pass 0 to restore always-repaint
+```
+
+Under the gate, a tick repaints when any of these hold: a `FrameClock`
+subscriber is live (a scripted `requestAnimationFrame`/timer, a running CSS
+animation, or a meter/scalar value source), a layout pass is pending, or — on
+SDKs that export `pulp::view::needs_continuous_frames` — any widget-level
+animation (knob hover glow, a time-driven shader). **Discrete changes are never
+gated**: the host→view push paths (`pulp_embed_param_changed`, `set_string`, the
+mouse dispatchers, `reload`) each repaint on their own, and `pulp_embed_repaint`
+always forces a paint.
+
+The one thing to check before enabling it: your live indicators (meters, scopes)
+must redraw off a `FrameClock`-backed source rather than relying on the
+unconditional per-tick repaint — otherwise they'd stop updating while the editor
+is otherwise idle. The predicate is proven by `tools/frame_gate_test.cpp`
+(`ctest -R embed-frame-gate`).
+
 ### Scoped out (this round)
 
 - **Zero-copy GPU compositing** (`IOSurface` / `MTLTexture` handle): deferred.

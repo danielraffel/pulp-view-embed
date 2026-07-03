@@ -32,6 +32,7 @@
 
 // The two Processor facades, split out for readability (private to this target).
 #include "embed_processors.hpp"
+#include "frame_gate.hpp"  // embed_view_needs_frame — the opt-in tick dirty gate
 
 #include <chrono>
 #include <cmath>
@@ -115,6 +116,14 @@ struct PulpEmbedView {
     // Widget captured at dispatch_mouse_down; drag/up replay against it until
     // up clears it (borrowed pointer, owned by the view tree).
     pulp::view::View* drag_target = nullptr;
+
+    // ── periodic-repaint dirty gate (ABI v9) ──
+    // OFF by default: pulp_embed_tick() repaints unconditionally, preserving the
+    // historical always-repaint behaviour. When a host opts in via
+    // pulp_embed_set_dirty_gate(true), tick repaints only when the view needs a
+    // frame (embed_view_needs_frame) — a silent editor idles to 0 fps. Discrete
+    // host/user changes are unaffected (they repaint on their own push path).
+    bool dirty_gate = false;
 
     // ── host resource staging (ABI v3) ──
     // Temp dir holding host-served asset bytes (resolve_resource), written so the
@@ -1298,9 +1307,16 @@ PulpEmbedResult pulp_embed_tick(PulpEmbedView* v) {
         poll_host_meters(v);
         // ABI v8: refresh the host param-surface snapshot (membership + display
         // text) ONCE here so the subsequent repaint reads cached state and never
-        // re-enters the host from paint.
+        // re-enters the host from paint. Runs every tick regardless of the gate —
+        // it is a cheap host-state refresh, not a paint.
         snapshot_host_param_surface(v);
-        v->host->repaint();
+        // Repaint every tick by default. When the dirty gate is opted in (ABI v9),
+        // repaint only when the tree is animating — discrete changes already
+        // repainted on their own push path, so skipping an idle tick loses nothing
+        // but frames.
+        if (!v->dirty_gate ||
+            pulp::embed::embed_view_needs_frame(v->bridge ? v->bridge->view() : nullptr))
+            v->host->repaint();
         return PULP_EMBED_OK;
     } catch (...) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, "tick threw");
@@ -1315,6 +1331,12 @@ PulpEmbedResult pulp_embed_repaint(PulpEmbedView* v) {
     } catch (...) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, "repaint threw");
     }
+}
+
+PulpEmbedResult pulp_embed_set_dirty_gate(PulpEmbedView* v, int32_t enabled) {
+    if (!v) return PULP_EMBED_ERR_INVALID_ARG;
+    v->dirty_gate = (enabled != 0);
+    return PULP_EMBED_OK;
 }
 
 PulpEmbedResult pulp_embed_reload_bundle(PulpEmbedView* v, const char* bundle_dir) {

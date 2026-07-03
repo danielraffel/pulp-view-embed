@@ -220,6 +220,21 @@ add_test(NAME embed-validate-faithful
         "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/figma-vst-style-faithful/design.ir.json"
         --design-w 1000 --design-h 600)
 
+# ── frame-gate predicate unit test ───────────────────────────────────────────
+# Pure logic over a hand-built View tree (no host): proves embed_view_needs_frame
+# — the decision behind pulp_embed_tick's opt-in dirty gate — idles a static tree
+# and keeps frames flowing for an active FrameClock subscriber or pending layout.
+# Portable C++ (same link recipe as pulp-embed-validate), so it gates on every OS.
+add_executable(pulp-embed-frame-gate tools/frame_gate_test.cpp)
+target_link_libraries(pulp-embed-frame-gate PRIVATE pulp_view_embed)
+if(APPLE)
+    target_link_libraries(pulp-embed-frame-gate PRIVATE "-framework AppKit")
+endif()
+if(UNIX AND NOT APPLE AND NOT ANDROID AND COMMAND pulp_link_fontconfig_after_skia)
+    pulp_link_fontconfig_after_skia(pulp-embed-frame-gate)
+endif()
+add_test(NAME embed-frame-gate COMMAND pulp-embed-frame-gate)
+
 # Linux: live X11 host smoke — attach Pulp's child into a real X11 parent window
 # and capture the live back buffer (proves the X11PluginViewHost attach path, not
 # just the headless render). Needs an X server at runtime (run via xvfb-run); the
