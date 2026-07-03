@@ -453,7 +453,7 @@ PulpEmbedResult pulp_embed_tick(PulpEmbedView* view);
 /* Request a repaint (e.g. after the host changed a value the view reflects). */
 PulpEmbedResult pulp_embed_repaint(PulpEmbedView* view);
 
-/* Opt into (enabled != 0) or out of (0) the tick dirty gate (ABI v8). Default
+/* Opt into (enabled != 0) or out of (0) the tick dirty gate (ABI v9). Default
  * OFF: pulp_embed_tick() repaints every call. When ON, tick repaints only when
  * the view needs a frame — an active FrameClock subscriber (a scripted rAF/
  * timer, a CSS animation, a meter/scalar source), a pending layout pass, or

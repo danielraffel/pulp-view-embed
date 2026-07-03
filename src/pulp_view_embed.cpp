@@ -1603,14 +1603,20 @@ size_t pulp_embed_get_string(PulpEmbedView* v, const char* key, char* buf, size_
 PulpEmbedResult pulp_embed_set_string(PulpEmbedView* v, const char* key, const char* utf8) {
     if (!v || !key) return PULP_EMBED_ERR_INVALID_ARG;
     try {
+        bool updated = false;
         for (auto& s : v->strings) {
             if (s.key != key || !s.widget) continue;
             // Apply without echoing back through TextEditor::on_change -> set_string.
             v->applying_host_string = true;
             s.widget->set_text(utf8 ? utf8 : "");
             v->applying_host_string = false;
+            updated = true;
             break;
         }
+        // Repaint on a real change so the pushed text shows this frame. Without
+        // this the display relied on the next unconditional tick — which the
+        // opt-in dirty gate can skip. Discrete push, so it repaints on its own.
+        if (updated && v->host) v->host->repaint();
         return PULP_EMBED_OK;  // unknown key tolerated (blind-push), like param_changed
     } catch (const std::exception& e) {
         v->applying_host_string = false;

@@ -17,6 +17,8 @@
 #ifndef PULP_VIEW_EMBED_FRAME_GATE_HPP
 #define PULP_VIEW_EMBED_FRAME_GATE_HPP
 
+#include <cstddef>
+
 #include <pulp/view/frame_clock.hpp>
 #include <pulp/view/view.hpp>
 
@@ -36,6 +38,17 @@
 
 namespace pulp::embed {
 
+// A pending layout pass anywhere in the tree needs a paint. View::layout_dirty()
+// is set on the RECEIVER of invalidate_layout(), not propagated to the root, so a
+// root-only check would miss a dirty descendant — walk the subtree.
+inline bool subtree_layout_dirty(pulp::view::View* v) {
+    if (!v) return false;
+    if (v->layout_dirty()) return true;
+    for (std::size_t i = 0; i < v->child_count(); ++i)
+        if (subtree_layout_dirty(v->child_at(i))) return true;
+    return false;
+}
+
 // True when `root`'s tree needs a repaint on THIS periodic tick. A null root
 // returns true (unknown → paint; the gate must never freeze a view it can't
 // reason about). `root` is the embed's root view (v->bridge->view()); the host
@@ -48,7 +61,7 @@ inline bool embed_view_needs_frame(pulp::view::View* root) {
 #endif
     if (auto* fc = root->frame_clock(); fc && fc->has_active_subscribers())
         return true;
-    if (root->layout_dirty()) return true;
+    if (subtree_layout_dirty(root)) return true;
     return false;
 }
 

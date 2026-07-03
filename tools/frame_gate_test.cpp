@@ -77,6 +77,18 @@ int main() {
         check(embed_view_needs_frame(&root), "layout dirty -> needs frame");
     }
 
+    // invalidate_layout marks only the receiver, so a dirty DESCENDANT (not the
+    // root) must still be caught by the subtree walk.
+    {
+        View root;
+        auto child = std::make_unique<View>();
+        View* c = child.get();
+        root.add_child(std::move(child));
+        c->invalidate_layout();
+        check(embed_view_needs_frame(&root),
+              "descendant layout dirty -> needs frame");
+    }
+
     std::printf(g_fail ? "\nFAILED (%d)\n" : "\nPASSED\n", g_fail);
     return g_fail ? 1 : 0;
 }
