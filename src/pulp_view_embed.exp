@@ -41,6 +41,7 @@ _pulp_embed_render_frame_rgba
 _pulp_embed_render_png
 _pulp_embed_repaint
 _pulp_embed_resize
+_pulp_embed_set_dirty_gate
 _pulp_embed_get_string
 _pulp_embed_set_string
 _pulp_embed_simulate_param_drag

@@ -56,7 +56,14 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 8u
+#define PULP_VIEW_EMBED_ABI_VERSION 9u
+
+/* v9 (2026-07): opt-in periodic-repaint dirty gate. Adds
+ * pulp_embed_set_dirty_gate() so a host can tell pulp_embed_tick() to repaint
+ * only when the view is animating, instead of every tick. Default OFF preserves
+ * the historical always-repaint behaviour, so v1..v8 callers are unaffected —
+ * pure additive function, no desc-layout change (the version bump is
+ * informational/monotonic). */
 
 /* v8 (2026-07): dynamic-UI host surface. Appends THREE callbacks to the END of
  * PulpEmbedHostCallbacks (after get_string), struct_size-gated exactly like the
@@ -437,11 +444,29 @@ PulpEmbedResult pulp_embed_resize(PulpEmbedView* view, int32_t width, int32_t he
 
 /* Pump one host idle tick so a scripted UI's poll()/timers/rAF keep running.
  * GPU hosts also drive their own display-link; CPU hosts treat this as a
- * repaint request. Call from the host's timer/idle callback. */
+ * repaint request. Call from the host's timer/idle callback.
+ *
+ * By default this repaints every tick. See pulp_embed_set_dirty_gate() to make
+ * the repaint conditional on the view actually animating. */
 PulpEmbedResult pulp_embed_tick(PulpEmbedView* view);
 
 /* Request a repaint (e.g. after the host changed a value the view reflects). */
 PulpEmbedResult pulp_embed_repaint(PulpEmbedView* view);
+
+/* Opt into (enabled != 0) or out of (0) the tick dirty gate (ABI v9). Default
+ * OFF: pulp_embed_tick() repaints every call. When ON, tick repaints only when
+ * the view needs a frame — an active FrameClock subscriber (a scripted rAF/
+ * timer, a CSS animation, a meter/scalar source), a pending layout pass, or
+ * (on SDKs that export it) any widget-level animation — so a silent editor idles
+ * to 0 fps. Discrete host/user changes are UNAFFECTED: they repaint on their own
+ * push path (pulp_embed_param_changed, set_string, the mouse dispatchers,
+ * reload) and pulp_embed_repaint() always forces a paint regardless of the gate.
+ *
+ * Turn this on only once the view's live indicators (meters, scopes) are driven
+ * by a FrameClock-backed source rather than relying on the unconditional
+ * per-tick repaint; otherwise those indicators would stop updating while idle.
+ * Returns PULP_EMBED_ERR_INVALID_ARG for a NULL view. */
+PulpEmbedResult pulp_embed_set_dirty_gate(PulpEmbedView* view, int32_t enabled);
 
 /* Reload the embedded design in place (ABI v4). For the high-fidelity bundle
  * path, rebuilds the scripted UI from `bundle_dir`'s ui.js — or the CURRENT
