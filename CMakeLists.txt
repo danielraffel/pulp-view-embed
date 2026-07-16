@@ -253,6 +253,21 @@ if(UNIX AND NOT APPLE AND NOT ANDROID AND COMMAND pulp_link_fontconfig_after_ski
 endif()
 add_test(NAME embed-param-key COMMAND pulp-embed-param-key)
 
+# ── control-geometry tests ───────────────────────────────────────────────────
+# pulp_embed_param_hit_point must report the point that actually LANDS on a named
+# control — proven by pressing it and asserting that control's gesture bracketed —
+# across a 1:1 fit, a uniform scale, and a letterboxed aspect. Same headless link
+# recipe as pulp-embed-param-key, so it gates on every OS.
+add_executable(pulp-embed-hit-point tools/hit_point_test.cpp)
+target_link_libraries(pulp-embed-hit-point PRIVATE pulp_view_embed)
+if(APPLE)
+    target_link_libraries(pulp-embed-hit-point PRIVATE "-framework AppKit")
+endif()
+if(UNIX AND NOT APPLE AND NOT ANDROID AND COMMAND pulp_link_fontconfig_after_skia)
+    pulp_link_fontconfig_after_skia(pulp-embed-hit-point)
+endif()
+add_test(NAME embed-hit-point COMMAND pulp-embed-hit-point)
+
 # Linux: live X11 host smoke — attach Pulp's child into a real X11 parent window
 # and capture the live back buffer (proves the X11PluginViewHost attach path, not
 # just the headless render). Needs an X server at runtime (run via xvfb-run); the

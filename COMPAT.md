@@ -25,8 +25,8 @@ these adapter tags.
 | Surface | Shipped value | Notes |
 |---------|---------------|-------|
 | Pulp SDK | v0.550.0 | Latest published SDK release. Ships a `find_package`-able `pulp-sdk-<platform>.tar.gz` (e.g. `pulp-sdk-darwin-arm64.tar.gz`, carrying `lib/cmake/Pulp/PulpConfig.cmake` + `libpulp-*.a`). The shim is built against the Pulp SDK; a foreign host linking the prebuilt dylib never sees this version. |
-| Embed ABI | v10 | `PULP_VIEW_EMBED_ABI_VERSION` in `include/pulp_view_embed.h`; the number `pulp_embed_abi_version()` reports. |
-| pulp-view-embed | v0.1.0 | This repo — the shim that provides embed ABI v10. |
+| Embed ABI | v11 | `PULP_VIEW_EMBED_ABI_VERSION` in `include/pulp_view_embed.h`; the number `pulp_embed_abi_version()` reports. |
+| pulp-view-embed | v0.1.0 | This repo — the shim that provides embed ABI v11. |
 | pulp-embed-juce | v0.1.0 | JUCE host adapter. |
 | pulp-embed-iplug2 | v0.1.0 | iPlug2 host adapter (parity with the JUCE adapter). |
 
@@ -54,6 +54,17 @@ the documented bounds without breaking the seam.
 | v8 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (dynamic-UI) | `has_param` / `param_display_text` snapshot, `host_action`; `dispatch_mouse_down/_drag/_up` |
 | v9 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (idle-gate) | `pulp_embed_set_dirty_gate` — opt-in idle repaint gate (default OFF; uses `needs_continuous_frames` when the SDK exports it, else a frame-clock/layout fallback) |
 | v10 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (step-count) | `host_param_steps` callback + `pulp_embed_param_steps` snapshot — the host's discrete step count for a key (0 = continuous/unknown), so a discrete control's divisor comes from the PARAMETER rather than the number of options the design draws; `pulp_embed_param_key_generation` — monotonic key-set counter a host gates its re-enumeration on (the only signal for a view-driven re-key) |
+| v11 | 0.1.0 (this release) | Pulp with `DesignFrameView::element_hit_point` (see note) | juce (drive-by-value) | `pulp_embed_param_hit_point` — the root-view point at which a pointer event lands on a control, so a host can aim `dispatch_mouse_down/_drag/_up` at a key it can already enumerate and drive it through the real gesture path (hit-test included) rather than reaching past hit-testing |
+
+> **v11 needs an SDK method no published SDK carries yet.** A control's hit
+> anchor, the panel crop origin, and the panel→view fit are all private to
+> `DesignFrameView`, so the shim cannot locate a control without
+> `DesignFrameView::element_hit_point` — added to the Pulp SDK alongside this ABI
+> version. Until an SDK release ships it, building the shim with v11 requires an
+> SDK built from a tree that has it. The method itself is additive and
+> layout-neutral (a non-virtual accessor, no new members), and it has been built
+> and tested against both 0.667.0 and 0.674.0 — so the SDK floor for v11 is
+> whichever release first ships it, not a specific version above.
 
 > The "Shim built vs SDK" column is the SDK the shim needs at **build time**; a
 > foreign host linking the prebuilt dylib never sees it. `pulp-package.json`'s
@@ -105,6 +116,9 @@ desc.struct_size = sizeof(PulpEmbedDesc);
 | String bridge | `>= 6` |
 | Missing-asset diagnostics | `>= 7` |
 | `has_param` / `param_display_text` snapshot, `host_action`, mouse down/drag/up | `>= 8` |
+| `set_dirty_gate` | `>= 9` |
+| `param_steps`, `param_key_generation` | `>= 10` |
+| `param_hit_point` | `>= 11` |
 
 Distribution + release mechanics (signing, notarization, the prebuilt tarball)
 live in [DISTRIBUTING.md](DISTRIBUTING.md).

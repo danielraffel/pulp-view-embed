@@ -422,6 +422,38 @@ Both are proven by `tools/param_key_test.cpp` (`ctest -R embed-param-key`),
 which also asserts that a re-key carries the UI→host writes/gestures and the
 host→UI pushes to the new key together.
 
+### Control geometry (ABI v11)
+
+`dispatch_mouse_down/_drag/_up` take root-view coordinates, so a host that wants
+to drive a control it can name had no way to aim them: a knob's hit anchor, the
+panel crop origin, and the panel→view fit are all private to the view.
+`pulp_embed_param_hit_point` closes that — it is the missing half of the dispatch
+family, turning an index into the point a pointer must land on.
+
+```c
+double x, y;
+if (pulp_embed_param_hit_point(view, index, &x, &y) == PULP_EMBED_OK) {
+    pulp_embed_dispatch_mouse_down(view, x, y);   /* hit-tests + captures */
+    pulp_embed_dispatch_mouse_drag(view, x, y - 20);
+    pulp_embed_dispatch_mouse_up(view, x, y - 20);
+}
+/* PULP_EMBED_ERR_UNSUPPORTED = this control has no locatable geometry (not on a
+   design frame, or not laid out yet). No fallback point is invented: a wrong
+   coordinate would miss and read as a dead control. Re-read after a resize —
+   the point tracks the live layout. */
+```
+
+This exists so a drive can keep the **real** gesture path. The older
+`pulp_embed_simulate_param_drag` reaches past hit-testing and drives the widget
+directly — useful as a bridge-plumbing probe, but it cannot catch a regression in
+hit-testing or event routing because it never runs them. Prefer composing
+`param_hit_point` + the dispatchers, and **measure** the control's response with
+`pulp_embed_param_value` rather than assuming its drag law (the law is per-kind
+and is the view's business). Proven by `tools/hit_point_test.cpp`
+(`ctest -R embed-hit-point`), which presses each reported point and asserts the
+named control — not a neighbour — took the gesture, at a 1:1 fit, a uniform
+scale, and a letterboxed aspect.
+
 ### Scoped out (this round)
 
 - **Zero-copy GPU compositing** (`IOSurface` / `MTLTexture` handle): deferred.

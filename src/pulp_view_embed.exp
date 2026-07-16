@@ -32,6 +32,7 @@ _pulp_embed_param_changed
 _pulp_embed_param_count
 _pulp_embed_param_display_text
 _pulp_embed_param_has
+_pulp_embed_param_hit_point
 _pulp_embed_param_info
 _pulp_embed_param_key
 _pulp_embed_param_key_generation

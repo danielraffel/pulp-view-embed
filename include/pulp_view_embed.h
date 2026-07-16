@@ -56,7 +56,27 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 10u
+#define PULP_VIEW_EMBED_ABI_VERSION 11u
+
+/* v11 (2026-07): control geometry. Adds pulp_embed_param_hit_point() — the
+ * root-view point at which a pointer event lands on a control. Additive
+ * function, no desc-layout change and no new host callback, so v1..v10 callers
+ * keep working unchanged.
+ *
+ * The mouse dispatchers take ROOT-VIEW coordinates, so a host that wants to
+ * drive a NAMED control through the real pointer path has to know where that
+ * control is. Nothing here exposed that: a control's hit anchor (a knob's pivot),
+ * the design's panel crop origin, and the panel->view fit are all private to the
+ * view, so the coordinate was underivable from outside and a host had no way to
+ * aim a click at a key it can already enumerate. Hosts were left with
+ * pulp_embed_simulate_param_drag(), which reaches PAST hit-testing and drives the
+ * widget directly — fine as a bridge-plumbing probe, but it cannot catch a
+ * regression in hit-testing or event routing, because it never runs them.
+ *
+ * With the point in hand a host composes the existing verbs — hit_point ->
+ * dispatch_mouse_down/drag/up -> pulp_embed_param_value — into a drive that runs
+ * the SAME code a user's mouse does, hit-test included, and can therefore fail
+ * the way production fails. */
 
 /* v10 (2026-07): host parameter step count. Appends ONE callback to the END of
  * PulpEmbedHostCallbacks (after host_action), struct_size-gated exactly like the
@@ -711,6 +731,31 @@ PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* view);
 PulpEmbedResult pulp_embed_dispatch_mouse_down(PulpEmbedView* view, double x, double y);
 PulpEmbedResult pulp_embed_dispatch_mouse_drag(PulpEmbedView* view, double x, double y);
 PulpEmbedResult pulp_embed_dispatch_mouse_up(PulpEmbedView* view, double x, double y);
+
+/* Where the control at `index` is (ABI v11): writes the ROOT-VIEW point — the
+ * same coordinate space the dispatchers above take — at which a pointer event
+ * lands on it. This is the missing half of the dispatch family: it turns a key a
+ * host can enumerate into a coordinate it can click.
+ *
+ * The point tracks the CURRENT layout (it is derived from the live panel fit), so
+ * re-read it after a resize rather than caching it. Writes nothing and returns
+ * PULP_EMBED_ERR_INVALID_ARG for a NULL view / NULL out-param / out-of-range
+ * index, and PULP_EMBED_ERR_UNSUPPORTED when this control has no locatable
+ * geometry — it is not on a design frame (a plain Knob/Fader/Toggle widget
+ * tree), or the view is not laid out yet. Never reports a plausible-looking
+ * fallback point: a wrong coordinate would silently miss the control and read as
+ * a dead control rather than a missing capability.
+ *
+ * Intended use is a value-driven drive that keeps the real gesture path:
+ *   pulp_embed_param_hit_point(v, i, &x, &y);
+ *   pulp_embed_dispatch_mouse_down(v, x, y);       // hit-tests + captures
+ *   pulp_embed_dispatch_mouse_drag(v, x, y - dy);  // MEASURE pulp_embed_param_value
+ *   ...                                            // iterate onto the target
+ *   pulp_embed_dispatch_mouse_up(v, x, y - dy);
+ * Prefer measuring the control's response over assuming its drag law: the law is
+ * the view's business and it differs per kind. */
+PulpEmbedResult pulp_embed_param_hit_point(PulpEmbedView* view, int32_t index,
+                                           double* out_x, double* out_y);
 
 /* ---- text-field string bridge (ABI v6) ------------------------------- *
  *

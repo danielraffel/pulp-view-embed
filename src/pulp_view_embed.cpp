@@ -2115,6 +2115,37 @@ PulpEmbedResult pulp_embed_dispatch_mouse_up(PulpEmbedView* v, double x, double 
     }
 }
 
+PulpEmbedResult pulp_embed_param_hit_point(PulpEmbedView* v, int32_t index,
+                                           double* out_x, double* out_y) {
+    if (!v || !out_x || !out_y || index < 0 ||
+        static_cast<size_t>(index) >= v->params.size())
+        return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto& b = v->params[static_cast<size_t>(index)];
+        // Only the design-frame lane can locate a control: its elements carry hit
+        // geometry the view can map. A plain Knob/Fader/Toggle tree has no such
+        // per-element anchor here, so report the capability as absent rather than
+        // guessing a point that would miss.
+        if (b.frame_element_index < 0 || !b.widget)
+            return set_err(v, PULP_EMBED_ERR_UNSUPPORTED,
+                           "control has no locatable geometry (not a design frame)");
+        auto* frame = static_cast<pulp::view::DesignFrameView*>(b.widget);
+        pulp::view::Point local{};
+        if (!frame->element_hit_point(b.frame_element_index, local))
+            return set_err(v, PULP_EMBED_ERR_UNSUPPORTED,
+                           "element has no hit point (view not laid out?)");
+        // Element-local -> root, the space the dispatchers hit-test in.
+        const auto ab = pulp::view::ViewInspector::absolute_bounds(*frame);
+        *out_x = static_cast<double>(ab.x + local.x);
+        *out_y = static_cast<double>(ab.y + local.y);
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "param_hit_point threw");
+    }
+}
+
 PulpEmbedResult pulp_embed_capture_png(PulpEmbedView* v, uint8_t* out,
                                        size_t cap, size_t* out_len) {
     if (!v || !v->host || !out_len) return PULP_EMBED_ERR_INVALID_ARG;
