@@ -139,6 +139,61 @@ private:
     void*                 ctx_ = nullptr;
 };
 
+// Backs the SDK's view-side host-parameter surface (View::host_params()).
+//
+// This exists for ONE answer the view cannot get any other way: the host
+// parameter's value COUNT. DesignFrameView scales a choice control by
+// param_step_count(key) - 1, and it reaches that only through host_params(). With
+// no surface installed the frame falls back to the number of positions the
+// control draws, so a 3-option control bound to a 6-value host parameter emits
+// idx/2 instead of idx/5 and slams the host to the parameter's last value at the
+// third position. The conversion happens INSIDE the frame (choice_to_norm), which
+// runs before on_element_changed hands this shim an already-normalized float —
+// so the shim cannot correct it after the fact, and the surface is the only seam.
+//
+// It is deliberately NOT a second write path. The bridge already funnels UI->host
+// through store -> param_listener -> host.set_param, and DesignFrameView's own
+// routing (route_changes_to_host_params) stays OFF, so the frame never calls
+// set_param/begin_gesture/end_gesture here. Those overrides are still implemented
+// honestly, via that same store funnel, so the surface tells the truth if the
+// routing is ever enabled — and writing through the store keeps ONE funnel rather
+// than a parallel one that would bypass the applying_host_change loop-break.
+//
+// Reads come from the PER-TICK SNAPSHOT, never from the host callbacks directly.
+// That is this shim's standing architecture (see snapshot_host_param_surface):
+// the paint path must not re-enter the host. It is load-bearing here because
+// DesignFrameView::element_value() on a choice element resolves the value count,
+// so has_param/param_step_count are reachable from paint — where a host round-trip
+// would run arbitrary plugin code mid-render-traversal, and where the SDK's own
+// call-context assert already fires.
+//
+// Like EmbedHostActionSurface it must OUTLIVE the open view, so it is an owned
+// member of PulpEmbedView declared before `bridge`. It needs the snapshot and the
+// store, so unlike that surface it does hold a back-pointer; the methods are
+// therefore defined out-of-line once PulpEmbedView is complete.
+class EmbedHostParamSurface : public pulp::view::HostParamSurface {
+public:
+    // Re-pointed on every bridge build for symmetry with the action surface; the
+    // handle is stable, but a rebuild is the moment the snapshot/store behind it
+    // are rebuilt too.
+    void configure(PulpEmbedView* view) { view_ = view; }
+
+protected:
+    bool do_has_param(std::string_view key) override;
+    double do_get_param(std::string_view key) override;
+    void do_set_param(std::string_view key, double normalized) override;
+    void do_begin_gesture(std::string_view key) override;
+    void do_end_gesture(std::string_view key) override;
+    std::string do_param_display_text(std::string_view key, double normalized) override;
+    int do_param_step_count(std::string_view key) override;
+
+private:
+    // Resolve a key to its slot in params/the parallel snapshots, or npos.
+    size_t slot_for(std::string_view key) const;
+
+    PulpEmbedView* view_ = nullptr;
+};
+
 }  // namespace
 
 // The opaque handle. Field order matters for teardown — see destroy().
@@ -146,10 +201,12 @@ struct PulpEmbedView {
     std::unique_ptr<pulp::format::Processor> processor;
     std::unique_ptr<pulp::state::StateStore> store;
     // Declared BEFORE `bridge` deliberately: the view tree (owned by `bridge`)
-    // holds a raw HostActionSurface* handed to it by set_host_actions, and the
-    // surface must outlive the open view. Reverse-declaration-order destruction
-    // therefore frees the tree first and this second.
+    // holds raw HostActionSurface* / HostParamSurface* pointers handed to it by
+    // set_host_actions / set_host_params, and a surface must outlive the open
+    // view. Reverse-declaration-order destruction therefore frees the tree first
+    // and these second.
     EmbedHostActionSurface host_action_surface;
+    EmbedHostParamSurface  host_param_surface;
     std::unique_ptr<pulp::format::ViewBridge> bridge;
     std::unique_ptr<pulp::view::PluginViewHost> host;
     PulpEmbedBackend backend = PULP_EMBED_BACKEND_UNKNOWN;
@@ -237,6 +294,101 @@ namespace {
 PulpEmbedResult set_err(PulpEmbedView* v, PulpEmbedResult r, std::string msg) {
     if (v) v->last_error = std::move(msg);
     return r;
+}
+
+// ── EmbedHostParamSurface ──────────────────────────────────────────────────
+// Defined here rather than at the class body because every override reads
+// PulpEmbedView, which is only complete above.
+
+size_t EmbedHostParamSurface::slot_for(std::string_view key) const {
+    if (!view_ || key.empty()) return static_cast<size_t>(-1);
+    // key_to_index is keyed by std::string; the heterogeneous lookup this would
+    // need is not enabled on it, so the view is copied into one. Off every
+    // real-time path by the surface's own call-context contract (tick/update
+    // only, never paint, never audio).
+    const auto it = view_->key_to_index.find(std::string(key));
+    if (it == view_->key_to_index.end()) return static_cast<size_t>(-1);
+    // key_to_index is rebuilt FROM params, so this holds by construction; it is
+    // asserted here anyway so every params[slot] below is unconditionally safe
+    // rather than safe-by-argument.
+    if (it->second >= view_->params.size()) return static_cast<size_t>(-1);
+    return it->second;
+}
+
+bool EmbedHostParamSurface::do_has_param(std::string_view key) {
+    const size_t slot = slot_for(key);
+    if (slot == static_cast<size_t>(-1)) return false;  // not a design control
+    if (slot >= view_->param_has_snapshot.size()) return false;
+    const int8_t answer = view_->param_has_snapshot[slot];
+    // -1 is "the host wired no has_param callback", NOT "unbound". The key is a
+    // control the bridge bound, and the host has volunteered no opinion to the
+    // contrary, so the binding stands. Reporting false here would be the quiet
+    // failure this surface exists to remove: DesignFrameView gates the step-count
+    // lookup on has_param, so a host that wires host_param_steps but not has_param
+    // would silently keep scaling choice controls by what they draw.
+    return answer != 0;
+}
+
+double EmbedHostParamSurface::do_get_param(std::string_view key) {
+    const size_t slot = slot_for(key);
+    if (slot == static_cast<size_t>(-1) || !view_->store) return 0.0;
+    // The store mirrors the host's value (pulp_embed_param_changed pushes into
+    // it), so this answers from local state rather than re-entering the host.
+    return static_cast<double>(view_->store->get_normalized(view_->params[slot].param_id));
+}
+
+void EmbedHostParamSurface::do_set_param(std::string_view key, double normalized) {
+    const size_t slot = slot_for(key);
+    if (slot == static_cast<size_t>(-1) || !view_->store) return;
+    // Through the store, not straight to host_cb.set_param: the store listener is
+    // the bridge's single UI->host funnel and carries the applying_host_change
+    // loop-break. A direct callback here would be a second, unguarded path.
+    view_->store->set_normalized(view_->params[slot].param_id,
+                                 static_cast<float>(normalized));
+}
+
+void EmbedHostParamSurface::do_begin_gesture(std::string_view key) {
+    const size_t slot = slot_for(key);
+    if (slot == static_cast<size_t>(-1) || !view_->store) return;
+    view_->store->begin_gesture(view_->params[slot].param_id);
+}
+
+void EmbedHostParamSurface::do_end_gesture(std::string_view key) {
+    const size_t slot = slot_for(key);
+    if (slot == static_cast<size_t>(-1) || !view_->store) return;
+    view_->store->end_gesture(view_->params[slot].param_id);
+}
+
+std::string EmbedHostParamSurface::do_param_display_text(std::string_view key,
+                                                         double normalized) {
+    // The snapshot holds the host's text for the value the parameter held at the
+    // last tick, which is what a view asking to render "the current value" wants.
+    // A request for the text of some OTHER normalized value cannot be served from
+    // it, and answering it would mean calling the host's formatter — arbitrary
+    // plugin code — off the snapshot cadence this shim is built around. Report the
+    // cached text only when the request matches the snapshotted value; an empty
+    // string is already this accessor's documented "host serves none".
+    (void)normalized;
+    const size_t slot = slot_for(key);
+    if (slot == static_cast<size_t>(-1)) return {};
+    if (slot >= view_->param_display_snapshot.size()) return {};
+    if (!view_->store) return {};
+    const double snapped =
+        static_cast<double>(view_->store->get_normalized(view_->params[slot].param_id));
+    if (std::fabs(snapped - normalized) > 1e-6) return {};
+    return view_->param_display_snapshot[slot];
+}
+
+int EmbedHostParamSurface::do_param_step_count(std::string_view key) {
+    const size_t slot = slot_for(key);
+    // 0 is the contract's single "no index domain / cannot answer" answer, and
+    // every miss collapses to it: an unknown key, a host that wired no
+    // host_param_steps (or one gated out by an older struct_size), and a
+    // genuinely continuous parameter. The snapshot already clamped a negative
+    // host answer to 0, so a caller can never see a second don't-know value.
+    if (slot == static_cast<size_t>(-1)) return 0;
+    if (slot >= view_->param_steps_snapshot.size()) return 0;
+    return static_cast<int>(view_->param_steps_snapshot[slot]);
 }
 
 // Validate + normalize the descriptor. Returns PULP_EMBED_OK or an error.
@@ -964,6 +1116,21 @@ void build_param_bridge(PulpEmbedView* v) {
     } else {
         root->set_host_actions(nullptr);
     }
+
+    // Host parameter surface: gives the view tree the HOST's value count per key,
+    // so DesignFrameView scales a choice control by the parameter's domain rather
+    // than by the number of positions it draws. Installed UNCONDITIONALLY, unlike
+    // the action surface above — every answer it serves is snapshot-backed and
+    // degrades on its own (an unwired host_param_steps reads 0 = "cannot answer",
+    // which the frame handles and reports), and the param bridge always exists.
+    // Gating on a callback would instead strip the view of has_param/get_param
+    // for hosts that wire only some of the block.
+    //
+    // route_changes_to_host_params stays OFF (the SDK default): the store
+    // listener is already the UI->host write funnel, so enabling it here would
+    // write every edit twice.
+    v->host_param_surface.configure(v);
+    root->set_host_params(&v->host_param_surface);
 
     // ABI v6: text_field string bridge (separate from the numeric params above).
     build_string_bridge(v);

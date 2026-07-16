@@ -7,7 +7,9 @@
 //      with it: UI->host writes/gestures and host->UI pushes.
 //   2. The host-action channel — a view calling host_actions()->send_host_action
 //      reaches the ABI's host_action callback.
-//   3. The host step-count callback + its struct_size gating.
+//   3. The host step-count callback + its struct_size gating, and the surface it
+//      backs: a choice control must scale by the HOST parameter's value count,
+//      not by the number of positions it happens to draw.
 //
 // A native DesignFrameView (pulp_embed_create_from_view) is the fixture: it is
 // the only lane that can re-key at runtime, and it needs no design fixture on
@@ -112,6 +114,48 @@ std::unique_ptr<pulp::view::View> makeView() {
     view->route_actions_to_host(true);
     g_frame = view.get();
     return view;
+}
+
+// ── choice fixture: a 3-position control over a 6-value host parameter ───────
+// Deliberately a SEPARATE view from makeView(): the tests above pin element
+// indices and param_count against that one, and a choice control's whole point
+// here is that its own option count must NOT be what scales it.
+// The rect spans the whole frame, and the SVG's intrinsic size matches the
+// view's logical size (kW x kH) so the panel transform is identity — SVG coords
+// are also the view coords a mouse dispatch takes. A smaller SVG here would be
+// scaled to the logical size and every click would land on the wrong tab.
+constexpr float kChoiceX = 0.0f, kChoiceY = 0.0f, kChoiceW = kW, kChoiceH = kH;
+constexpr int   kChoiceOptions = 3;
+
+pulp::view::DesignFrameView* g_choice_frame = nullptr;  // borrowed; owned by the tree
+
+std::unique_ptr<pulp::view::View> makeChoiceView() {
+    using El = pulp::view::DesignFrameElement;
+    El tabs;
+    tabs.kind = El::Kind::tab_group;
+    tabs.x = kChoiceX; tabs.y = kChoiceY; tabs.w = kChoiceW; tabs.h = kChoiceH;
+    tabs.options = {"A", "B", "C"};   // 3 drawn positions
+    tabs.selected_index = 0;
+    tabs.param_key = "mode";          // ...bound to a 6-value host parameter
+
+    const std::string svg =
+        R"(<svg width="240" height="80" xmlns="http://www.w3.org/2000/svg">)"
+        R"(<rect x="0" y="0" width="240" height="80" fill="#222"/></svg>)";
+    auto view = std::make_unique<pulp::view::DesignFrameView>(svg, std::vector<El>{tabs});
+    g_choice_frame = view.get();
+    return view;
+}
+
+// Click the center of tab `index`. Goes through the real ABI mouse dispatch, so
+// this exercises the same path a user tap does: DesignTabGroup hit-test ->
+// on_select -> the frame's choice_to_norm -> on_element_changed -> store ->
+// listener -> host.set_param.
+void clickTab(PulpEmbedView* v, int index) {
+    const double cell = kChoiceW / static_cast<double>(kChoiceOptions);
+    const double cx = kChoiceX + cell * (static_cast<double>(index) + 0.5);
+    const double cy = kChoiceY + kChoiceH / 2.0;
+    pulp_embed_dispatch_mouse_down(v, cx, cy);
+    pulp_embed_dispatch_mouse_up(v, cx, cy);
 }
 
 // Fill a descriptor wired to `host`. `struct_size`/`abi_version` are left at the
@@ -291,6 +335,111 @@ void testStepCount() {
     pulp_embed_destroy(v);
 }
 
+// ── the motivating case: a 3-option control on a 6-value host parameter ──────
+// The control draws 3 positions; the parameter has 6 values. The third position
+// is value index 2 of 6, so it must emit 2/5 = 0.4. Scaling by what the control
+// draws yields 2/2 = 1.0 and slams the host to the parameter's LAST value —
+// the defect a consumer was working around with a per-control denominator
+// override. This is the end-to-end proof, through the embed's own ABI.
+void testChoiceScalesByHostStepCount() {
+    FakeHost host;
+    host.members = {"mode"};
+    host.steps["mode"] = 6;  // the host's parameter carries 6 values
+    PulpEmbedDesc d = makeDesc(host);
+    PulpEmbedView* v = nullptr;
+    if (pulp::embed::pulp_embed_create_from_view(&d, &makeChoiceView, &v) != PULP_EMBED_OK || !v) {
+        char err[512] = {0};
+        pulp_embed_last_create_error(err, sizeof err);
+        check(false, "create_from_view (choice fixture)");
+        std::printf("     create error: %s\n", err);
+        return;
+    }
+
+    check(pulp_embed_param_steps(v, "mode") == 6,
+          "the 6-value host param reports 6 through the snapshot");
+
+    host.sets.clear();
+    clickTab(v, 2);  // the third drawn position = value index 2 of 6
+
+    const bool emitted = !host.sets.empty() && host.sets.back().first == "mode";
+    check(emitted, "clicking the third position wrote to the host under 'mode'");
+    if (emitted) {
+        const double got = host.sets.back().second;
+        check(approx(got, 2.0 / 5.0),
+              "a 3-option control on a 6-value param emits idx/5, not idx/2");
+        // Name the specific regression: dividing by the drawn option count.
+        check(!approx(got, 1.0),
+              "the third position does NOT slam the host to the param's last value");
+        if (!approx(got, 2.0 / 5.0)) std::printf("     emitted %.6f, expected %.6f\n", got, 2.0 / 5.0);
+    }
+
+    // Index 1 of 6 is 1/5 = 0.2 (the buggy divisor would give 1/2 = 0.5).
+    host.sets.clear();
+    clickTab(v, 1);
+    check(!host.sets.empty() && approx(host.sets.back().second, 1.0 / 5.0),
+          "the second position emits 1/5");
+
+    // Index 0 pins to 0.0 under either divisor — it must still hold.
+    host.sets.clear();
+    clickTab(v, 0);
+    check(!host.sets.empty() && approx(host.sets.back().second, 0.0),
+          "the first position emits 0");
+
+    pulp_embed_destroy(v);
+}
+
+// A continuous host parameter reports 0 ("no index domain"). The surface must
+// never divide by it: the control keeps its own positions as the only domain
+// available, and the guess is reported rather than silently absorbed.
+void testChoiceOnContinuousHostParam() {
+    FakeHost host;
+    host.members = {"mode"};
+    // No host.steps entry -> stepsOf answers 0 = continuous/unknown.
+    PulpEmbedDesc d = makeDesc(host);
+    PulpEmbedView* v = nullptr;
+    if (pulp::embed::pulp_embed_create_from_view(&d, &makeChoiceView, &v) != PULP_EMBED_OK || !v) {
+        check(false, "create_from_view (continuous-param fixture)");
+        return;
+    }
+    check(pulp_embed_param_steps(v, "mode") == 0, "a continuous host param reports 0");
+
+    host.sets.clear();
+    clickTab(v, 2);
+    // Documented fallback: 0 is not a divisor, so the element's own 3 positions
+    // are used — 2/2 = 1.0. Correct HERE (the param has no index domain), and
+    // reported via the SDK's scale-mismatch diagnostic rather than assumed.
+    check(!host.sets.empty() && approx(host.sets.back().second, 1.0),
+          "a 0 step count falls back to the control's own option count");
+    pulp_embed_destroy(v);
+}
+
+// The struct_size gate still holds with the surface installed: a host block that
+// stops before host_param_steps must degrade to "cannot answer" (0) — never read
+// the absent tail and never produce a garbage divisor.
+void testChoiceUnderPreviousAbiStructSize() {
+    FakeHost host;
+    host.members = {"mode"};
+    host.steps["mode"] = 6;
+    PulpEmbedDesc d = makeDesc(host);
+    d.abi_version = PULP_VIEW_EMBED_ABI_VERSION - 1u;
+    d.struct_size = static_cast<uint32_t>(offsetof(PulpEmbedDesc, host) +
+                                          offsetof(PulpEmbedHostCallbacks, host_param_steps));
+    PulpEmbedView* v = nullptr;
+    if (pulp::embed::pulp_embed_create_from_view(&d, &makeChoiceView, &v) != PULP_EMBED_OK || !v) {
+        check(false, "a previous-ABI-sized desc is accepted with a choice control");
+        return;
+    }
+    check(pulp_embed_param_steps(v, "mode") == 0,
+          "the gated-out host_param_steps reads as 0, not garbage");
+    host.sets.clear();
+    clickTab(v, 2);
+    // Degrades to the control's own count — the pre-existing behavior, not a
+    // crash and not a divisor invented from unread memory.
+    check(!host.sets.empty() && approx(host.sets.back().second, 1.0),
+          "an older host degrades to the option count without crashing");
+    pulp_embed_destroy(v);
+}
+
 // A negative step count is not a second "don't know" answer — it clamps to 0.
 void testNegativeStepsClamp() {
     FakeHost host;
@@ -364,6 +513,9 @@ int main() {
     testStepCount();
     testNegativeStepsClamp();
     testPreviousAbiStructSizeGating();
+    testChoiceScalesByHostStepCount();
+    testChoiceOnContinuousHostParam();
+    testChoiceUnderPreviousAbiStructSize();
     testDuplicateKeyIsReported();
     std::printf("%s\n", g_fail == 0 ? "param-key test: all pass"
                                     : "param-key test: FAILURES");
