@@ -19,6 +19,7 @@
 #include <pulp/state/parameter.hpp>
 #include <pulp/state/store.hpp>
 #include <pulp/view/design_frame_view.hpp>
+#include <pulp/view/host_param_surface.hpp>  // HostActionSurface (view->host commands)
 #include <pulp/view/text_editor.hpp>
 #include <pulp/view/design_import.hpp>
 #include <pulp/view/design_ir.hpp>
@@ -44,6 +45,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -99,12 +101,55 @@ struct ParamBinding {
     std::string name;  // design caption (label); "" -> has_meta 0, fall back to key
 };
 
+// Backs the SDK's view-side host-action channel (View::host_actions()) with the
+// ABI's host_action callback, so a native view that calls
+// host_actions()->send_host_action(...) — or a DesignFrameView with
+// route_actions_to_host(true), whose action-button click fires the same call —
+// reaches the foreign host.
+//
+// The surface must OUTLIVE the open view (HostActionSurface's contract), so it is
+// an owned member of PulpEmbedView rather than a local: the view tree is torn
+// down in destroy() while the handle, and therefore this, is still alive. It
+// holds the callback + ctx directly rather than a PulpEmbedView back-pointer,
+// which keeps it independent of that (later-defined) type.
+class EmbedHostActionSurface : public pulp::view::HostActionSurface {
+public:
+    // Re-pointed on every bridge build, so a reload re-installs the live
+    // callback rather than stranding the surface on a stale one.
+    void configure(PulpEmbedHostActionFn fn, void* ctx) { fn_ = fn; ctx_ = ctx; }
+
+protected:
+    bool do_send_host_action(std::string_view action, std::string_view args_json) override {
+        if (!fn_) return false;
+        // The C ABI takes NUL-terminated strings; a string_view carries no NUL
+        // guarantee, so each argument is copied into one. The allocation is safe
+        // here BY CONSTRUCTION: host actions fire from the UI thread's mouse
+        // handler (never the audio thread, never paint — the SDK's
+        // HostActionSurface call-context assert rejects a no-alloc/paint scope
+        // outright), so this is off every real-time path.
+        const std::string a(action);
+        const std::string j(args_json);
+        // The int return is diagnostic-only per the ABI contract — the caller
+        // must not branch on it — so it is forwarded, never interpreted here.
+        return fn_(ctx_, a.c_str(), j.empty() ? nullptr : j.c_str()) != 0;
+    }
+
+private:
+    PulpEmbedHostActionFn fn_ = nullptr;
+    void*                 ctx_ = nullptr;
+};
+
 }  // namespace
 
 // The opaque handle. Field order matters for teardown — see destroy().
 struct PulpEmbedView {
     std::unique_ptr<pulp::format::Processor> processor;
     std::unique_ptr<pulp::state::StateStore> store;
+    // Declared BEFORE `bridge` deliberately: the view tree (owned by `bridge`)
+    // holds a raw HostActionSurface* handed to it by set_host_actions, and the
+    // surface must outlive the open view. Reverse-declaration-order destruction
+    // therefore frees the tree first and this second.
+    EmbedHostActionSurface host_action_surface;
     std::unique_ptr<pulp::format::ViewBridge> bridge;
     std::unique_ptr<pulp::view::PluginViewHost> host;
     PulpEmbedBackend backend = PULP_EMBED_BACKEND_UNKNOWN;
@@ -136,6 +181,12 @@ struct PulpEmbedView {
     void* host_ctx = nullptr;
     std::vector<ParamBinding> params;         // stable, registration-ordered
     std::unordered_map<std::string, size_t> key_to_index;
+    // Monotonic generation of the KEY SET (pulp_embed_param_key_generation).
+    // Bumped by every bridge rebuild and every runtime re-key, so a host can gate
+    // its re-enumeration on an integer compare instead of re-reading every key
+    // per tick. A re-key originates inside the view, so this is the only signal a
+    // host gets that its cached key->parameter bindings went stale.
+    uint64_t param_key_generation = 0;
     pulp::state::ListenerToken param_listener; // forwards store changes to host
     // Guard: true while applying a HOST-driven change so the store listener does
     // not bounce the value back out to host.set_param (feedback-loop break).
@@ -167,6 +218,13 @@ struct PulpEmbedView {
     // formatted value string ("500 ms"), empty when the host serves none.
     std::vector<int8_t>      param_has_snapshot;
     std::vector<std::string> param_display_snapshot;
+
+    // ── host param step count (ABI v10) ──
+    // Snapshotted with the v8 surface above and indexed parallel to `params`.
+    // 0 = continuous or unknown (no host_param_steps callback, or the host
+    // reports continuous); a positive entry is the host's step count. A design's
+    // own option_count is NOT a substitute — only the host knows the real count.
+    std::vector<int32_t> param_steps_snapshot;
 
     // Thread that created the view. pulp_embed_reload_bundle (which rebuilds views
     // + touches the GPU surface) must run here; a call from another thread is
@@ -214,6 +272,33 @@ void capture_host_callbacks(PulpEmbedView* v, const PulpEmbedDesc* desc) {
     std::memcpy(&v->host_cb, &desc->host, avail);
 }
 
+// Rebuild key_to_index from the CURRENT ParamBinding::key values.
+//
+// The map is DERIVED state: it is only ever a projection of ParamBinding::key,
+// so any code path that changes a binding's key must update the binding FIRST
+// and call this second. (Rebuilding it from unchanged binding keys is a no-op.)
+//
+// A param key must be unique within a view — the host->UI push resolves a key to
+// a single element, so a duplicate makes one element permanently unreachable and
+// silently misroutes host pushes to the other. pulp_view_embed_native.hpp
+// declares that uniqueness as a caller contract; this records a violation in
+// last_error instead of losing it, so a host that breaks the contract can see
+// why its control went dead. The last binding wins (insertion order).
+void rebuild_key_index(PulpEmbedView* v) {
+    v->key_to_index.clear();
+    std::string dupes;
+    for (size_t i = 0; i < v->params.size(); ++i) {
+        const auto& key = v->params[i].key;
+        if (!v->key_to_index.insert_or_assign(key, i).second) {
+            if (!dupes.empty()) dupes += ", ";
+            dupes += key;
+        }
+    }
+    if (!dupes.empty())
+        v->last_error = "param key bound to more than one element: " + dupes +
+                        " (keys must be unique per view; the last element wins)";
+}
+
 // Forward declarations — the param-bridge builders are defined further down
 // (next to the host/session wiring) but the create paths above reference them.
 void build_param_bridge(PulpEmbedView* v);
@@ -221,6 +306,7 @@ void build_string_bridge(PulpEmbedView* v);
 void collect_missing_render_assets(PulpEmbedView* v);
 void poll_host_meters(PulpEmbedView* v);
 void snapshot_host_param_surface(PulpEmbedView* v);
+void snapshot_host_param_at(PulpEmbedView* v, size_t i);
 
 // ── host resource staging (resolve_resource, ABI v3) ───────────────────────
 //
@@ -707,11 +793,20 @@ void build_param_bridge(PulpEmbedView* v) {
         auto reused = prev.find(b.key);
         const bool is_new = (reused == prev.end());
         b.param_id = is_new ? ++max_id : reused->second;
-        v->key_to_index[b.key] = i;
 
         if (is_new) {
             pulp::state::ParamInfo info;
             info.id = b.param_id;
+            // ParamInfo::name records the key the param was FIRST registered
+            // under and is never rewritten — StateStore has no rename API, and a
+            // runtime re-key (set_element_param_key) deliberately does not try to
+            // fake one. This is cosmetic, not a bug: the store param is an
+            // INTERNAL handle bound to the element, not to the host key. Every
+            // key-addressed path (host->UI push, UI->host write, the gesture
+            // brackets, the host surface snapshot) resolves through
+            // ParamBinding::key / key_to_index, which the re-key handler keeps
+            // current — so a re-keyed element routes correctly while its store
+            // param keeps its original, purely-diagnostic name.
             info.name = b.key;
             info.range = pulp::state::ParamRange{0.0f, 1.0f, 0.0f, 0.0f};
             v->store->add_parameter(info);
@@ -739,6 +834,12 @@ void build_param_bridge(PulpEmbedView* v) {
         if (b.frame_element_index < 0)
             wire_widget_to_host(v, b);
     }
+
+    // Project the (now final) binding keys into the key->index registry. A
+    // rebuild re-collects the key set wholesale (a reload can add/drop/reorder
+    // keys), so it counts as a key-set change for a host's dirty gate.
+    rebuild_key_index(v);
+    ++v->param_key_generation;
 
     // Gesture begin/end forwarding (one set of callbacks for the whole store).
     if (v->host_cb.begin_gesture || v->host_cb.end_gesture) {
@@ -797,30 +898,80 @@ void build_param_bridge(PulpEmbedView* v) {
         frame->on_gesture_end = [self, pid_for](int idx) {
             if (auto pid = pid_for(idx)) self->store->end_gesture(pid);
         };
+
+        // Runtime re-key (paged rack / tabbed slot): set_element_param_key mutates
+        // the element's param_key INSIDE the view. Every embed-side use of that
+        // key is a COPY taken when this bridge was built, so without this handler
+        // BOTH directions keep addressing the OLD host param:
+        //   UI->host — the store listener and the gesture brackets read
+        //              ParamBinding::key, so writes and begin/end land on the old
+        //              parameter.
+        //   host->UI — key_to_index still maps the old key to this element, so a
+        //              push under the new key silently no-ops while a push under
+        //              the old key moves the wrong control.
+        // Refreshing key_to_index alone does NOT fix this: the map is derived from
+        // ParamBinding::key, so it must be rebuilt AFTER the binding's key is
+        // updated, never instead of it.
+        frame->on_param_key_changed = [self](int idx, const std::string& key) {
+            size_t slot = 0;
+            bool bound = false;
+            for (size_t i = 0; i < self->params.size(); ++i) {
+                if (self->params[i].frame_element_index != idx) continue;
+                // widget_id tracks key for a frame element (they are the same
+                // string by construction in both the faithful and native lanes),
+                // so it moves with it and pulp_embed_param_widget_id stays honest.
+                self->params[i].key = key;
+                self->params[i].widget_id = key;
+                slot = i;
+                bound = true;
+                break;
+            }
+            // An element with no binding was not value-bearing (or carried an
+            // empty key) when the bridge was built; re-keying it does not create a
+            // binding — a host that needs one rebuilds the bridge (reload).
+            if (!bound) return;
+            rebuild_key_index(self);
+            // Publish the change: a host's pump gates its re-enumeration on this
+            // counter, and a re-key is driven from inside the view, so this is
+            // the host's ONLY signal that its cached bindings just went stale.
+            ++self->param_key_generation;
+            // The host param-surface snapshot (membership / display text / step
+            // count) is keyed off ParamBinding::key, so this element's slots now
+            // describe the OLD parameter. Re-resolve just this one now rather
+            // than leaving it wrong until the next tick — a re-key is a discrete
+            // UI-thread event, and a stale membership answer is exactly the class
+            // of bug this handler exists to close.
+            if (slot < self->param_has_snapshot.size())
+                snapshot_host_param_at(self, slot);
+        };
+    }
+
+    // ABI v8 host_action (view->host): back the SDK's view-side host-action
+    // channel with the captured C callback. A view reaches the host through
+    // View::host_actions()->send_host_action(...) — either directly (a native
+    // view) or via a DesignFrameView action button when the author opted in with
+    // route_actions_to_host(true).
+    //
+    // Installed only when the host wired the callback: with no host_action there
+    // is nothing to forward, and leaving host_actions() null keeps the SDK's own
+    // "no host action channel" path intact. Re-configured (not re-allocated) on
+    // every build so a reload re-points the surface at the live callback and the
+    // fresh view tree; the surface itself is an owned member, so it outlives the
+    // view it is installed on, as its contract requires.
+    if (v->host_cb.host_action) {
+        v->host_action_surface.configure(v->host_cb.host_action, v->host_ctx);
+        root->set_host_actions(&v->host_action_surface);
+    } else {
+        root->set_host_actions(nullptr);
     }
 
     // ABI v6: text_field string bridge (separate from the numeric params above).
     build_string_bridge(v);
 
-    // ABI v8: seed the host param-surface snapshot (has_param / param_display_text)
-    // so the getters are populated before the first tick. Refreshed each tick.
+    // Seed the host param-surface snapshot (has_param / param_display_text, and
+    // the v10 step count) so the getters are populated before the first tick.
+    // Refreshed each tick.
     snapshot_host_param_surface(v);
-
-    // ABI v8, host_action (view->host): captured in host_cb via capture_host_
-    // callbacks. It is fired when the embedded design activates an ACTION-kind
-    // control (a button/menu command that is not a normalized param — the
-    // native-lane switch above intentionally skips momentary/swap/action/
-    // value_label/custom as "no host param"). The faithful/native DesignFrameView
-    // does not yet expose a per-element action callback, so there is no live
-    // trigger to route today; the moment it gains one (e.g. on_element_action),
-    // forward it here as:
-    //   frame->on_element_action = [self](int idx){
-    //       if (self->host_cb.host_action)
-    //           self->host_cb.host_action(self->host_ctx,
-    //                                     self->params_action_name(idx), nullptr);
-    //   };
-    // The callback is captured and ABI-stable now so hosts can wire it ahead of
-    // that view-side surface (int return is diagnostic-only; must not block).
 }
 
 // Build the text-field string bridge (ABI v6): discover bindable text_field
@@ -907,44 +1058,71 @@ void poll_host_meters(PulpEmbedView* v) {
     // session's AudioBridge here.
 }
 
-// Snapshot the host param surface (ABI v8) into local state. Called at create /
-// reload (from build_param_bridge) and every tick. The embedded view's paint
-// path reads the cache (pulp_embed_param_has / pulp_embed_param_display_text) —
-// it MUST NOT re-enter the host per frame, so the one host round-trip happens
-// here, at tick, not in paint. Sizing is always kept in lockstep with `params`
-// so the getters index safely even when no v8 callback is wired (all -1/empty).
+// Re-resolve ONE param's host surface (membership / display text / step count)
+// into the snapshot slots at `i`. The caller guarantees the slots are sized (see
+// snapshot_host_param_surface) and that `i` is in range. Split out so a discrete
+// re-key can refresh just the element that moved instead of re-walking every
+// param — a paged rack re-keys a couple of elements out of a couple of hundred.
+void snapshot_host_param_at(PulpEmbedView* v, size_t i) {
+    const auto& b = v->params[i];
+    // Reset to the "don't know" defaults first: a callback the host does not
+    // wire must leave the documented answer, not a value from a previous key.
+    v->param_has_snapshot[i] = -1;
+    v->param_display_snapshot[i].clear();
+    v->param_steps_snapshot[i] = 0;
+
+    if (v->host_cb.has_param)
+        v->param_has_snapshot[i] = static_cast<int8_t>(
+            v->host_cb.has_param(v->host_ctx, b.key.c_str()) ? 1 : 0);
+
+    if (v->host_cb.host_param_steps) {
+        const int32_t steps = v->host_cb.host_param_steps(v->host_ctx, b.key.c_str());
+        // Clamp a negative to the documented 0: the ABI has exactly one "don't
+        // know" answer, and a host must not be able to invent another.
+        v->param_steps_snapshot[i] = steps > 0 ? steps : 0;
+    }
+
+    if (v->host_cb.param_display_text) {
+        const double norm =
+            v->store ? static_cast<double>(v->store->get_normalized(b.param_id))
+                     : 0.0;
+        char buf[256];
+        const size_t len = v->host_cb.param_display_text(v->host_ctx, b.key.c_str(),
+                                                         norm, buf, sizeof buf);
+        if (len == 0) return;                       // no display text for this key
+        if (len < sizeof buf) {
+            v->param_display_snapshot[i].assign(buf, len);
+        } else {
+            // Host reports a string longer than our stack buffer — re-query with
+            // an exact-sized heap buffer (two-call sizing contract).
+            std::string big(len + 1, '\0');
+            size_t got = v->host_cb.param_display_text(
+                v->host_ctx, b.key.c_str(), norm, big.data(), big.size());
+            if (got > len) got = len;
+            v->param_display_snapshot[i].assign(big.data(), got);
+        }
+    }
+}
+
+// Snapshot the host param surface (ABI v8 membership/display text + the v10 step
+// count) into local state. Called at create / reload (from build_param_bridge)
+// and every tick. The embedded view's paint path reads the cache
+// (pulp_embed_param_has / pulp_embed_param_display_text / pulp_embed_param_steps)
+// — it MUST NOT re-enter the host per frame, so the one host round-trip happens
+// here, at tick, not in paint. Sizing is always kept in lockstep with `params` so
+// the getters index safely even when no callback is wired (all -1/empty/0).
 void snapshot_host_param_surface(PulpEmbedView* v) {
     if (!v) return;
     const size_t n = v->params.size();
     v->param_has_snapshot.assign(n, static_cast<int8_t>(-1));
     v->param_display_snapshot.assign(n, std::string());
-    if (!v->host_cb.has_param && !v->host_cb.param_display_text) return;
-    for (size_t i = 0; i < n; ++i) {
-        const auto& b = v->params[i];
-        if (v->host_cb.has_param)
-            v->param_has_snapshot[i] = static_cast<int8_t>(
-                v->host_cb.has_param(v->host_ctx, b.key.c_str()) ? 1 : 0);
-        if (v->host_cb.param_display_text) {
-            const double norm =
-                v->store ? static_cast<double>(v->store->get_normalized(b.param_id))
-                         : 0.0;
-            char buf[256];
-            size_t len = v->host_cb.param_display_text(v->host_ctx, b.key.c_str(),
-                                                       norm, buf, sizeof buf);
-            if (len == 0) continue;                 // no display text for this key
-            if (len < sizeof buf) {
-                v->param_display_snapshot[i].assign(buf, len);
-            } else {
-                // Host reports a string longer than our stack buffer — re-query
-                // with an exact-sized heap buffer (two-call sizing contract).
-                std::string big(len + 1, '\0');
-                size_t got = v->host_cb.param_display_text(
-                    v->host_ctx, b.key.c_str(), norm, big.data(), big.size());
-                if (got > len) got = len;
-                v->param_display_snapshot[i].assign(big.data(), got);
-            }
-        }
-    }
+    // 0 = continuous/unknown, so an unwired host_param_steps leaves every entry
+    // at the correct "no step divisor" answer.
+    v->param_steps_snapshot.assign(n, 0);
+    if (!v->host_cb.has_param && !v->host_cb.param_display_text &&
+        !v->host_cb.host_param_steps)
+        return;
+    for (size_t i = 0; i < n; ++i) snapshot_host_param_at(v, i);
 }
 
 // Shared create path for the high-fidelity scripted-UI bundle. bundle_dir must
@@ -1305,10 +1483,10 @@ PulpEmbedResult pulp_embed_tick(PulpEmbedView* v) {
         // event-driven via DesignFrameView::on_element_changed, not polled here.)
         if (v->store) v->store->pump_listeners();
         poll_host_meters(v);
-        // ABI v8: refresh the host param-surface snapshot (membership + display
-        // text) ONCE here so the subsequent repaint reads cached state and never
-        // re-enters the host from paint. Runs every tick regardless of the gate —
-        // it is a cheap host-state refresh, not a paint.
+        // Refresh the host param-surface snapshot (membership + display text +
+        // step count) ONCE here so the subsequent repaint reads cached state and
+        // never re-enters the host from paint. Runs every tick regardless of the
+        // gate — it is a cheap host-state refresh, not a paint.
         snapshot_host_param_surface(v);
         // Repaint every tick by default. When the dirty gate is opted in (ABI v9),
         // repaint only when the tree is animating — discrete changes already
@@ -1481,6 +1659,22 @@ int32_t pulp_embed_param_has(PulpEmbedView* v, const char* key) {
     if (it == v->key_to_index.end()) return -1;          // not a design control
     if (it->second >= v->param_has_snapshot.size()) return -1;
     return static_cast<int32_t>(v->param_has_snapshot[it->second]);  // -1 / 0 / 1
+}
+
+uint64_t pulp_embed_param_key_generation(PulpEmbedView* v) {
+    return v ? v->param_key_generation : 0;
+}
+
+int32_t pulp_embed_param_steps(PulpEmbedView* v, const char* key) {
+    // Every don't-know case collapses to 0 ("continuous or unknown") per the ABI
+    // contract: NULL view/key, a key that is not a design control, a host with no
+    // host_param_steps callback, and a genuinely continuous parameter are all
+    // indistinguishable to the caller by design.
+    if (!v || !key) return 0;
+    auto it = v->key_to_index.find(key);
+    if (it == v->key_to_index.end()) return 0;
+    if (it->second >= v->param_steps_snapshot.size()) return 0;
+    return v->param_steps_snapshot[it->second];
 }
 
 size_t pulp_embed_param_display_text(PulpEmbedView* v, int32_t index,

@@ -56,7 +56,28 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 9u
+#define PULP_VIEW_EMBED_ABI_VERSION 10u
+
+/* v10 (2026-07): host parameter step count. Appends ONE callback to the END of
+ * PulpEmbedHostCallbacks (after host_action), struct_size-gated exactly like the
+ * v3/v6/v8 tails, so a v1..v9 caller's smaller desc stops before it (read as
+ * NULL):
+ *   host_param_steps — the host's discrete step count for a key.
+ * A design cannot know a host parameter's discreteness: a radio with 3 VISIBLE
+ * options may be bound to a 6-step host parameter, and the normalized value a
+ * control emits must be derived from the PARAMETER's step count, not from the
+ * number of options the UI happens to draw. Only the host knows the real count,
+ * so it is asked. Consumed through the same per-tick SNAPSHOT as the v8 surface
+ * (pulp_embed_param_steps), so paint never calls back into the host. The
+ * host-block growth is struct_size-gated; the query function is additive, so
+ * v9 callers keep working unchanged.
+ *
+ * v10 also adds pulp_embed_param_key_generation() — a monotonic counter for the
+ * view's registration KEY SET, bumped on every runtime re-key and bridge
+ * rebuild. A re-key is driven from inside the view, so without this a host
+ * cannot know its key set moved; it is the cheap dirty gate a host->UI pump
+ * needs to avoid re-enumerating the ABI every tick. Additive function, no desc
+ * change. */
 
 /* v9 (2026-07): opt-in periodic-repaint dirty gate. Adds
  * pulp_embed_set_dirty_gate() so a host can tell pulp_embed_tick() to repaint
@@ -235,6 +256,23 @@ typedef size_t (*PulpEmbedParamDisplayTextFn)(void* host_ctx, const char* key,
 typedef int    (*PulpEmbedHostActionFn)(void* host_ctx, const char* action,
                                         const char* args_json);
 
+/* Host parameter step count (ABI v10).
+ *
+ * The number of DISCRETE steps the host's parameter `key` has, or 0 for a
+ * continuous parameter / an unknown key — 0 means "continuous or unknown", and
+ * a caller must not distinguish the two.
+ *
+ * This is the divisor authority for a discrete control. The design's own option
+ * count is NOT it: a design may draw 3 radio options for a parameter the host
+ * defines with 6 steps, and the normalized value has to be derived from the
+ * host's count or the control addresses the wrong steps. The count is the number
+ * of steps, NOT a pre-computed divisor — a consumer derives the divisor from it
+ * under the host framework's own normalization convention.
+ *
+ * host->view, read through the per-tick snapshot (pulp_embed_param_steps), so
+ * paint never re-enters the host. Optional (NULL slot = every key reports 0). */
+typedef int32_t (*PulpEmbedHostParamStepsFn)(void* host_ctx, const char* key);
+
 typedef struct PulpEmbedHostCallbacks {
     PulpEmbedSetParamFn   set_param;     /* UI gesture -> host param write      */
     PulpEmbedGetParamFn   get_param;     /* host -> view initial-value pull     */
@@ -251,6 +289,8 @@ typedef struct PulpEmbedHostCallbacks {
     PulpEmbedHasParamFn         has_param;          /* live membership (auth.)   */
     PulpEmbedParamDisplayTextFn param_display_text; /* formatted value string    */
     PulpEmbedHostActionFn       host_action;        /* opaque view->host command */
+    /* ABI v10 tail — struct_size-gated (v1..v9 callers stop before this). */
+    PulpEmbedHostParamStepsFn   host_param_steps;   /* discrete steps; 0 = cont. */
 } PulpEmbedHostCallbacks;
 
 /* Creation descriptor. Zero-initialize, then set struct_size = sizeof(*desc),
@@ -586,6 +626,36 @@ PulpEmbedResult pulp_embed_param_info(PulpEmbedView* view, int32_t index,
 int32_t pulp_embed_param_has(PulpEmbedView* view, const char* key);
 size_t  pulp_embed_param_display_text(PulpEmbedView* view, int32_t index,
                                       char* buf, size_t cap);
+
+/* The host's discrete step count for `key`, as of the last snapshot (ABI v10).
+ * Reads the per-tick snapshot taken from host.host_param_steps — it never calls
+ * back into the host, so it is safe from a paint/layout path.
+ *
+ * Returns 0 for "continuous or unknown", which deliberately collapses every
+ * don't-know case: a continuous host parameter, a host that wires no
+ * host_param_steps callback, a key that is not a design control, and a NULL
+ * view. A caller must not distinguish them — 0 means "do not use a step
+ * divisor". A positive return is the host's authoritative step COUNT (not a
+ * divisor; derive the divisor from it). */
+int32_t pulp_embed_param_steps(PulpEmbedView* view, const char* key);
+
+/* Generation counter for the view's parameter KEY SET (ABI v10).
+ *
+ * Bumped whenever the set of registration keys can have changed: a runtime
+ * re-key (a paged/tabbed control re-pointing an element at another host
+ * parameter) and every param-bridge rebuild (creation, pulp_embed_reload_bundle).
+ * Monotonic for the life of the handle; 0 for a NULL view.
+ *
+ * This exists because a re-key is driven from INSIDE the view — a design's own
+ * chevron/tab click — so a host has no other way to learn its key set moved.
+ * Without it, a host->UI pump built at mount time keeps pushing the OLD keys and
+ * a re-keyed control silently stops tracking automation.
+ *
+ * Intended use is a dirty gate: cache this value, compare it once per tick, and
+ * re-enumerate pulp_embed_param_count/_key ONLY when it changes. That keeps the
+ * steady-state pump at a single integer compare instead of re-reading the whole
+ * key set every frame. */
+uint64_t pulp_embed_param_key_generation(PulpEmbedView* view);
 
 /* Host -> view: push a NORMALIZED [0,1] value for the parameter identified by
  * `key` (host automation, preset recall, get_param sync). Updates the embed's

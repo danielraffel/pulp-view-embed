@@ -390,6 +390,38 @@ unconditional per-tick repaint — otherwise they'd stop updating while the edit
 is otherwise idle. The predicate is proven by `tools/frame_gate_test.cpp`
 (`ctest -R embed-frame-gate`).
 
+### Host step count + live keys (ABI v10)
+
+A design cannot know a host parameter's discreteness: a radio drawn with 3
+visible options may be bound to a 6-step parameter, and a control that derives
+its value from the number of options it draws addresses the wrong steps. The
+host is the authority, so it is asked — `host.host_param_steps(key)`, read back
+off the per-tick snapshot (never from paint):
+
+```c
+int32_t steps = pulp_embed_param_steps(view, "lfo_waveform");  /* 6 */
+/* 0 = CONTINUOUS or UNKNOWN — one answer, deliberately indistinguishable. It
+   also covers "no host_param_steps callback" and "not a design control", so
+   treat 0 as "do not use a step divisor". A positive value is a step COUNT, not
+   a divisor. */
+```
+
+A control can also be **re-keyed at run time** (`set_element_param_key` — a paged
+rack, a tabbed slot). That is driven from inside the view, so a host has no way
+to notice on its own; `pulp_embed_param_key_generation(view)` is the signal. It
+bumps on every re-key and every bridge rebuild, so a host gates its
+re-enumeration on an integer compare instead of re-reading the whole key set
+every tick:
+
+```c
+uint64_t gen = pulp_embed_param_key_generation(view);
+if (gen != cached_gen) { cached_gen = gen; /* re-enumerate param_count/_key */ }
+```
+
+Both are proven by `tools/param_key_test.cpp` (`ctest -R embed-param-key`),
+which also asserts that a re-key carries the UI→host writes/gestures and the
+host→UI pushes to the new key together.
+
 ### Scoped out (this round)
 
 - **Zero-copy GPU compositing** (`IOSurface` / `MTLTexture` handle): deferred.

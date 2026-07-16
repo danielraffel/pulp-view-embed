@@ -34,6 +34,8 @@ _pulp_embed_param_display_text
 _pulp_embed_param_has
 _pulp_embed_param_info
 _pulp_embed_param_key
+_pulp_embed_param_key_generation
+_pulp_embed_param_steps
 _pulp_embed_param_value
 _pulp_embed_param_widget_id
 _pulp_embed_reload_bundle
