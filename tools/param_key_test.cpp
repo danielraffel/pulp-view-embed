@@ -23,7 +23,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <set>
@@ -66,6 +69,23 @@ struct FakeHost {
         const auto it = of(c).steps.find(k ? k : "");
         return it == of(c).steps.end() ? 0 : it->second;
     }
+    // Echo the key AND the value back, so a test can prove which VALUE's text it
+    // got — not just which key resolved. A formatter is a pure function of the
+    // value it is handed, which is exactly the pairing the display snapshot must
+    // preserve.
+    static size_t displayTextWithValue(void*, const char* k, double n, char* buf,
+                                       size_t cap) {
+        char v[32];
+        std::snprintf(v, sizeof v, "%.3f", n);
+        const std::string s = std::string("disp:") + (k ? k : "") + "@" + v;
+        if (buf && cap) {
+            const size_t len = s.size() < cap - 1 ? s.size() : cap - 1;
+            std::memcpy(buf, s.data(), len);
+            buf[len] = '\0';
+        }
+        return s.size();
+    }
+
     // Echo the key back in the text so a test can prove WHICH key was resolved.
     static size_t displayText(void*, const char* k, double, char* buf, size_t cap) {
         const std::string s = std::string("disp:") + (k ? k : "");
@@ -111,6 +131,9 @@ std::unique_ptr<pulp::view::View> makeView() {
         R"(<rect x="0" y="0" width="240" height="80" fill="#222"/></svg>)";
     auto view = std::make_unique<pulp::view::DesignFrameView>(svg, std::move(els));
     // Opt the action button into the host channel — OFF by default in the SDK.
+    // This is the NATIVE lane, so arming it here is what a view's author does in
+    // their own factory, not a reach-around the fixture needs. The imported lane,
+    // which has no author, is armed by the shim and covered separately below.
     view->route_actions_to_host(true);
     g_frame = view.get();
     return view;
@@ -388,6 +411,287 @@ void testChoiceScalesByHostStepCount() {
     pulp_embed_destroy(v);
 }
 
+// ── a readout never shows one value's text against another value ─────────────
+// The display snapshot pairs a host-formatted string with the value it was
+// formatted at, and the surface serves it only for THAT value. The pairing is
+// what makes the guard mean something: a readout's text is a claim about a
+// specific value, so serving it for a different one is a wrong number on screen,
+// not a stale-but-harmless one.
+//
+// The window is real: the snapshot refreshes at tick, and the store can move
+// between ticks (a host push, a UI edit). This drives that window directly —
+// snapshot at one value, move the store, then pull through the frame's own
+// host->UI sync, which is the path a readout actually takes.
+constexpr int kLabelIdx = 1;  // the value_label's element index in makeLabelView
+
+pulp::view::DesignFrameView* g_label_frame = nullptr;  // borrowed; owned by the tree
+
+std::unique_ptr<pulp::view::View> makeLabelView() {
+    using El = pulp::view::DesignFrameElement;
+    El k;
+    k.kind = El::Kind::knob;
+    k.cx = 60.0f; k.cy = 40.0f; k.hit_radius = 18.0f;
+    k.needle_d = "M0 0L0 -8";
+    k.value = 0.5f;
+    k.param_key = "gain";
+
+    // The readout tracks the SAME key as the knob. It carries no host param of its
+    // own (the native lane binds no value_label), so only the knob binds "gain" —
+    // the label just reads that key's text through the surface.
+    El lbl;
+    lbl.kind = El::Kind::value_label;
+    lbl.x = 100.0f; lbl.y = 30.0f; lbl.w = 100.0f; lbl.h = 20.0f;
+    lbl.param_key = "gain";
+
+    std::vector<El> els{k, lbl};
+    const std::string svg =
+        R"(<svg width="240" height="80" xmlns="http://www.w3.org/2000/svg">)"
+        R"(<rect x="0" y="0" width="240" height="80" fill="#222"/></svg>)";
+    auto view = std::make_unique<pulp::view::DesignFrameView>(svg, std::move(els));
+    g_label_frame = view.get();
+    return view;
+}
+
+void testDisplayTextNeverServesAnotherValuesText() {
+    FakeHost host;
+    host.members = {"gain"};
+    PulpEmbedDesc d = makeDesc(host);
+    d.host.param_display_text = &FakeHost::displayTextWithValue;
+    PulpEmbedView* v = nullptr;
+    if (pulp::embed::pulp_embed_create_from_view(&d, &makeLabelView, &v) != PULP_EMBED_OK ||
+        !v || !g_label_frame) {
+        char err[512] = {0};
+        pulp_embed_last_create_error(err, sizeof err);
+        check(false, "create_from_view (value_label fixture)");
+        std::printf("     create error: %s\n", err);
+        return;
+    }
+
+    // Create seeds the snapshot at the knob's 0.5, so the readout starts correct.
+    g_label_frame->sync_from_host_params();
+    check(g_label_frame->element_text(kLabelIdx) == "disp:gain@0.500",
+          "the readout starts on its value's text");
+
+    // Move the store WITHOUT ticking: the snapshot still holds 0.5's text, but the
+    // parameter is now at 0.25. This is the window a between-tick change opens.
+    pulp_embed_param_changed(v, "gain", 0.25);
+    g_label_frame->sync_from_host_params();
+
+    // The readout must not present 0.5's text as 0.25's. Naming the specific wrong
+    // string is the point — an assertion that merely required "some text" would
+    // pass on exactly the bug.
+    const std::string mid = g_label_frame->element_text(kLabelIdx);
+    check(mid != "disp:gain@0.500",
+          "a stale snapshot is not served as the new value's text");
+    if (mid == "disp:gain@0.500")
+        std::printf("     the readout showed 0.5's text while the param sat at 0.25\n");
+
+    // The next tick re-snapshots, and the readout comes back on its own — the
+    // refusal is a one-tick gap, not a latched-off readout.
+    check(pulp_embed_tick(v) == PULP_EMBED_OK, "tick re-snapshots the surface");
+    g_label_frame->sync_from_host_params();
+    check(g_label_frame->element_text(kLabelIdx) == "disp:gain@0.250",
+          "the readout returns on the next tick, on the RIGHT value's text");
+
+    pulp_embed_destroy(v);
+}
+
+// ── an IMPORTED design's action button reaches the host ──────────────────────
+// Every other fixture here is the NATIVE lane, where the view's author arms the
+// frame's action routing themselves (makeView does, above). An imported design
+// has no author to do that: its elements come out of DesignIR, so the shim is the
+// only seam that can arm it. This drives the imported lane end-to-end — DesignIR
+// JSON in, click out — because that is the lane whose action buttons were inert.
+//
+// The faithful lane materializes its frame from an SVG asset, so the fixture
+// writes a throwaway design to disk rather than hand-building a view.
+struct ImportedDesign {
+    std::filesystem::path dir;
+    std::string           json;
+
+    ~ImportedDesign() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);  // best-effort: a temp dir, not state
+    }
+};
+
+// Build a minimal faithful design: a full-bleed panel carrying one bindable knob
+// and one action button. The SVG's intrinsic size matches the view's logical
+// size, so the panel transform is identity and the action rect below is also the
+// view-space rect a click must land on.
+bool makeImportedDesign(ImportedDesign& out) {
+    std::error_code ec;
+    const auto base = std::filesystem::temp_directory_path(ec);
+    if (ec) return false;
+    out.dir = base / "pulp-embed-imported-action-test";
+    std::filesystem::remove_all(out.dir, ec);
+    if (!std::filesystem::create_directories(out.dir, ec)) return false;
+
+    {
+        std::ofstream svg(out.dir / "panel.svg");
+        if (!svg) return false;
+        svg << R"(<svg width="240" height="80" xmlns="http://www.w3.org/2000/svg">)"
+            << R"(<rect x="0" y="0" width="240" height="80" fill="#222"/></svg>)";
+        if (!svg.good()) return false;
+    }
+
+    out.json = R"({
+      "version": 1,
+      "root": {
+        "type": "frame",
+        "name": "Imported",
+        "style": { "width": 240, "height": 80, "backgroundColor": "#222226" },
+        "render_mode": "faithful_svg",
+        "svg_asset_id": "panel-svg",
+        "interactive_elements": [
+          { "kind": "knob", "cx": 60, "cy": 40, "hit_radius": 18,
+            "svg_patch_d": "M60 40L60 32", "default_value": 0.5,
+            "label": "Gain", "param_key": "gain" },
+          { "kind": "action", "x": 100, "y": 4, "w": 40, "h": 20,
+            "action": "load_preset", "label": "Load" }
+        ],
+        "children": []
+      },
+      "assetManifest": {
+        "version": 1,
+        "assets": [
+          { "asset_id": "panel-svg", "local_path": "panel.svg",
+            "content_hash": "panel", "mime": "image/svg+xml" }
+        ]
+      }
+    })";
+    return true;
+}
+
+// Click the imported design's action rect (SVG coords == view coords here).
+void clickImportedAction(PulpEmbedView* v) {
+    const double cx = kActionX + kActionW / 2.0;
+    const double cy = kActionY + kActionH / 2.0;
+    pulp_embed_dispatch_mouse_down(v, cx, cy);
+    pulp_embed_dispatch_mouse_up(v, cx, cy);
+}
+
+void testImportedDesignActionReachesHost() {
+    ImportedDesign design;
+    if (!makeImportedDesign(design)) {
+        check(false, "the imported-design fixture was written");
+        return;
+    }
+
+    FakeHost host;
+    PulpEmbedDesc d = makeDesc(host);
+    const std::string base = design.dir.string();
+    d.asset_base_path = base.c_str();
+    PulpEmbedView* v = nullptr;
+    if (pulp_embed_create_from_design_json_str(&d, design.json.data(), design.json.size(),
+                                               &v) != PULP_EMBED_OK || !v) {
+        char err[512] = {0};
+        pulp_embed_last_create_error(err, sizeof err);
+        check(false, "create_from_design_json_str (imported-action fixture)");
+        std::printf("     create error: %s\n", err);
+        return;
+    }
+
+    // Prove the design materialized before reading anything into the click below:
+    // a fixture that silently lost its elements would otherwise make the routing
+    // assertion pass or fail for the wrong reason. The knob's binding is the
+    // signal — this pins the element the fixture depends on, deliberately not the
+    // total count, which also carries the non-value kinds.
+    bool bound = false;
+    for (int32_t i = 0; i < pulp_embed_param_count(v); ++i)
+        if (paramKey(v, i) == "knob:0") bound = true;
+    check(bound, "the imported design materialized and bound its knob");
+
+    host.actions.clear();
+    clickImportedAction(v);
+    check(host.actions.size() == 1, "an imported design's action button reaches host_action");
+    if (host.actions.size() == 1)
+        check(host.actions[0].first == "load_preset", "the imported action carried its id");
+
+    pulp_embed_destroy(v);
+}
+
+// The same imported design, with a host that wired NO host_action. Nothing is
+// routed and nothing crashes: the routing follows the host's opt-in, so a host
+// that never asked for actions keeps the frame's own default behavior.
+void testImportedDesignActionWithoutHostCallback() {
+    ImportedDesign design;
+    if (!makeImportedDesign(design)) {
+        check(false, "the imported-design fixture was written (no-callback case)");
+        return;
+    }
+
+    FakeHost host;
+    PulpEmbedDesc d = makeDesc(host);
+    const std::string base = design.dir.string();
+    d.asset_base_path = base.c_str();
+    d.host.host_action = nullptr;  // the host never asked for action buttons
+    PulpEmbedView* v = nullptr;
+    if (pulp_embed_create_from_design_json_str(&d, design.json.data(), design.json.size(),
+                                               &v) != PULP_EMBED_OK || !v) {
+        check(false, "create_from_design_json_str (no host_action)");
+        return;
+    }
+
+    host.actions.clear();
+    clickImportedAction(v);
+    check(host.actions.empty(), "no host_action callback -> an imported action routes nowhere");
+
+    pulp_embed_destroy(v);
+}
+
+// ── a host that wires host_param_steps but NOT has_param ─────────────────────
+// The step-count fix only reaches the frame through has_param: resolve_value_count
+// gates the whole step lookup on it, so a surface that reports "unbound" for a key
+// whose membership the host never opined on throws the scaling back onto the drawn
+// option count — silently restoring the exact defect above.
+//
+// Wiring only part of the host block is the normal case, not a contrived one: the
+// callbacks are independent and a host adopting the step count has no reason to
+// also implement membership. So -1 ("host wired no has_param") must read as BOUND,
+// which is what makes this fixture emit idx/5 rather than idx/2.
+void testChoiceScalesWhenHostWiresNoHasParam() {
+    FakeHost host;
+    // Deliberately NO host.members: the has_param callback is left unwired below,
+    // so this set would not be consulted anyway.
+    host.steps["mode"] = 6;
+    PulpEmbedDesc d = makeDesc(host);
+    d.host.has_param = nullptr;  // the host volunteers no membership opinion
+    PulpEmbedView* v = nullptr;
+    if (pulp::embed::pulp_embed_create_from_view(&d, &makeChoiceView, &v) != PULP_EMBED_OK || !v) {
+        char err[512] = {0};
+        pulp_embed_last_create_error(err, sizeof err);
+        check(false, "create_from_view (no-has_param fixture)");
+        std::printf("     create error: %s\n", err);
+        return;
+    }
+
+    // The step count still reaches the snapshot — has_param does not gate the ABI
+    // getter, only the frame's use of it. Pinning it here separates "the count is
+    // missing" from "the count is present but the frame refused to use it", so a
+    // failure below cannot be misread as an unwired step callback.
+    check(pulp_embed_param_steps(v, "mode") == 6,
+          "the step count is reported even with has_param unwired");
+
+    host.sets.clear();
+    clickTab(v, 2);  // the third drawn position = value index 2 of 6
+
+    const bool emitted = !host.sets.empty() && host.sets.back().first == "mode";
+    check(emitted, "clicking the third position wrote to the host under 'mode'");
+    if (emitted) {
+        const double got = host.sets.back().second;
+        check(approx(got, 2.0 / 5.0),
+              "an unwired has_param still scales by the parameter, not the options");
+        // Name the regression this pins: treating -1 ("no opinion") as unbound
+        // drops the divisor back to the drawn option count and emits 1.0.
+        check(!approx(got, 1.0),
+              "a host with no has_param is not silently scaled by what it draws");
+        if (!approx(got, 2.0 / 5.0)) std::printf("     emitted %.6f, expected %.6f\n", got, 2.0 / 5.0);
+    }
+
+    pulp_embed_destroy(v);
+}
+
 // A continuous host parameter reports 0 ("no index domain"). The surface must
 // never divide by it: the control keeps its own positions as the only domain
 // available, and the guess is reported rather than silently absorbed.
@@ -510,10 +814,14 @@ int main() {
     testRekey();
     testHostAction();
     testHostActionAbsent();
+    testDisplayTextNeverServesAnotherValuesText();
+    testImportedDesignActionReachesHost();
+    testImportedDesignActionWithoutHostCallback();
     testStepCount();
     testNegativeStepsClamp();
     testPreviousAbiStructSizeGating();
     testChoiceScalesByHostStepCount();
+    testChoiceScalesWhenHostWiresNoHasParam();
     testChoiceOnContinuousHostParam();
     testChoiceUnderPreviousAbiStructSize();
     testDuplicateKeyIsReported();

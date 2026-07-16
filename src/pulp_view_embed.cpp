@@ -41,6 +41,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <regex>
 #include <sstream>
@@ -102,10 +103,11 @@ struct ParamBinding {
 };
 
 // Backs the SDK's view-side host-action channel (View::host_actions()) with the
-// ABI's host_action callback, so a native view that calls
-// host_actions()->send_host_action(...) — or a DesignFrameView with
-// route_actions_to_host(true), whose action-button click fires the same call —
-// reaches the foreign host.
+// ABI's host_action callback, so a view calling host_actions()->send_host_action(...)
+// reaches the foreign host. Two producers land here: a native view sending
+// directly (its author picks which of its buttons are host commands), and a
+// DesignFrameView whose action routing is armed — which for an IMPORTED design is
+// this shim's job, since that lane has no author to arm it (see build_param_bridge).
 //
 // The surface must OUTLIVE the open view (HostActionSurface's contract), so it is
 // an owned member of PulpEmbedView rather than a local: the view tree is torn
@@ -275,6 +277,11 @@ struct PulpEmbedView {
     // formatted value string ("500 ms"), empty when the host serves none.
     std::vector<int8_t>      param_has_snapshot;
     std::vector<std::string> param_display_snapshot;
+    // The normalized value each param_display_snapshot entry was FORMATTED AT.
+    // The text is only meaningful for that value, so this is what a request must
+    // match — not the store's live value, which by definition moved on if it
+    // disagrees. NaN = no text snapshotted (never matches any request).
+    std::vector<double>      param_display_norm_snapshot;
 
     // ── host param step count (ABI v10) ──
     // Snapshotted with the v8 surface above and indexed parallel to `params`.
@@ -366,16 +373,31 @@ std::string EmbedHostParamSurface::do_param_display_text(std::string_view key,
     // A request for the text of some OTHER normalized value cannot be served from
     // it, and answering it would mean calling the host's formatter — arbitrary
     // plugin code — off the snapshot cadence this shim is built around. Report the
-    // cached text only when the request matches the snapshotted value; an empty
-    // string is already this accessor's documented "host serves none".
-    (void)normalized;
+    // cached text only when the request matches the value that text was FORMATTED
+    // AT, which is the only value it describes.
+    //
+    // Matching against the snapshot's own value is load-bearing, not bookkeeping.
+    // The live store is NOT the comparand: the sole caller passes get_param(),
+    // which reads that same live store, so comparing against it always matches and
+    // the guard degrades to a no-op that hands back whatever text the last tick
+    // left. When the store moves between ticks the snapshot goes stale, and a
+    // no-op guard would render the PREVIOUS value's text as though it were this
+    // value's — a readout confidently displaying the wrong number.
+    //
+    // A mismatch returns empty, which the contract already defines as "host serves
+    // none". The two are deliberately not distinguished: the surface returns a
+    // std::string, so "" is the only "no answer" it has, and both cases mean the
+    // same thing to a caller — no text is available for this value right now. The
+    // next tick re-snapshots and the text returns.
     const size_t slot = slot_for(key);
     if (slot == static_cast<size_t>(-1)) return {};
     if (slot >= view_->param_display_snapshot.size()) return {};
-    if (!view_->store) return {};
-    const double snapped =
-        static_cast<double>(view_->store->get_normalized(view_->params[slot].param_id));
-    if (std::fabs(snapped - normalized) > 1e-6) return {};
+    if (slot >= view_->param_display_norm_snapshot.size()) return {};
+    const double snapped = view_->param_display_norm_snapshot[slot];
+    // Written as a positive test so a NaN "nothing snapshotted" fails it: every
+    // comparison against NaN is false, so the guard refuses rather than serving a
+    // stale entry.
+    if (!(std::fabs(snapped - normalized) <= 1e-6)) return {};
     return view_->param_display_snapshot[slot];
 }
 
@@ -1101,8 +1123,8 @@ void build_param_bridge(PulpEmbedView* v) {
     // ABI v8 host_action (view->host): back the SDK's view-side host-action
     // channel with the captured C callback. A view reaches the host through
     // View::host_actions()->send_host_action(...) — either directly (a native
-    // view) or via a DesignFrameView action button when the author opted in with
-    // route_actions_to_host(true).
+    // view) or via a DesignFrameView action button once route_actions_to_host is
+    // armed.
     //
     // Installed only when the host wired the callback: with no host_action there
     // is nothing to forward, and leaving host_actions() null keeps the SDK's own
@@ -1116,6 +1138,29 @@ void build_param_bridge(PulpEmbedView* v) {
     } else {
         root->set_host_actions(nullptr);
     }
+
+    // Arm the frame's action routing in the IMPORTED lane, and only there.
+    //
+    // The SDK defaults route_actions_to_host_ OFF, so a Kind::action button fires
+    // on_action and nothing else. That default is right for a view whose author is
+    // present: a native view (below) is constructed by a factory this shim calls,
+    // and its author holds route_actions_to_host() and decides which of their
+    // buttons are host commands versus view-internal (paging chevrons, tabs).
+    //
+    // An IMPORTED design has no such author. Its elements come from DesignIR — a
+    // design tool emits an action button, and nothing between that JSON and here
+    // can opt it in. Left at the default, an imported action button is inert: it
+    // can never reach host_action, no matter what the host wires. This shim is the
+    // only seam that exists, so it is the one that must arm it.
+    //
+    // The host's own opt-in is the gate, and it is the signal the ABI already
+    // carries: wiring host_action IS the statement "route action buttons to me".
+    // A host that wired nothing keeps the pre-existing inert behavior exactly, so
+    // this can only turn a dead button live — never redirect a live one. Nothing
+    // new is invented, and no ABI verb is needed to say what the callback says.
+    if (dynamic_cast<EmbedProcessor*>(v->processor.get()))
+        if (auto* frame = find_design_frame_view(root))
+            frame->route_actions_to_host(v->host_cb.host_action != nullptr);
 
     // Host parameter surface: gives the view tree the HOST's value count per key,
     // so DesignFrameView scales a choice control by the parameter's domain rather
@@ -1236,6 +1281,7 @@ void snapshot_host_param_at(PulpEmbedView* v, size_t i) {
     // wire must leave the documented answer, not a value from a previous key.
     v->param_has_snapshot[i] = -1;
     v->param_display_snapshot[i].clear();
+    v->param_display_norm_snapshot[i] = std::numeric_limits<double>::quiet_NaN();
     v->param_steps_snapshot[i] = 0;
 
     if (v->host_cb.has_param)
@@ -1253,6 +1299,10 @@ void snapshot_host_param_at(PulpEmbedView* v, size_t i) {
         const double norm =
             v->store ? static_cast<double>(v->store->get_normalized(b.param_id))
                      : 0.0;
+        // Record what the text below is formatted at BEFORE the callback runs, so
+        // the pairing holds on every exit from this block — including the len == 0
+        // early return, where the entry stays empty and the value is irrelevant.
+        v->param_display_norm_snapshot[i] = norm;
         char buf[256];
         const size_t len = v->host_cb.param_display_text(v->host_ctx, b.key.c_str(),
                                                          norm, buf, sizeof buf);
@@ -1283,6 +1333,9 @@ void snapshot_host_param_surface(PulpEmbedView* v) {
     const size_t n = v->params.size();
     v->param_has_snapshot.assign(n, static_cast<int8_t>(-1));
     v->param_display_snapshot.assign(n, std::string());
+    // NaN = nothing snapshotted, so an unwired param_display_text leaves every
+    // entry unable to match any request — the correct "no text" answer.
+    v->param_display_norm_snapshot.assign(n, std::numeric_limits<double>::quiet_NaN());
     // 0 = continuous/unknown, so an unwired host_param_steps leaves every entry
     // at the correct "no step divisor" answer.
     v->param_steps_snapshot.assign(n, 0);

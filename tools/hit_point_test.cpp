@@ -56,6 +56,9 @@ constexpr float kKnob0Cx = 60.0f, kKnob0Cy = 40.0f;
 constexpr float kKnob1Cx = 180.0f, kKnob1Cy = 40.0f;
 // The toggle is rect-hit rather than pivot-hit; its anchor is the rect center.
 constexpr float kTogX = 10.0f, kTogY = 60.0f, kTogW = 20.0f, kTogH = 12.0f;
+constexpr int   kTogIdx = 2;  // the toggle's element index in makeView()'s list
+
+pulp::view::DesignFrameView* g_frame = nullptr;  // borrowed; owned by the view tree
 
 std::unique_ptr<pulp::view::View> makeView() {
     using El = pulp::view::DesignFrameElement;
@@ -80,7 +83,9 @@ std::unique_ptr<pulp::view::View> makeView() {
     const std::string svg =
         R"(<svg width="240" height="80" xmlns="http://www.w3.org/2000/svg">)"
         R"(<rect x="0" y="0" width="240" height="80" fill="#222"/></svg>)";
-    return std::make_unique<pulp::view::DesignFrameView>(svg, std::move(els));
+    auto view = std::make_unique<pulp::view::DesignFrameView>(svg, std::move(els));
+    g_frame = view.get();
+    return view;
 }
 
 PulpEmbedDesc makeDesc(FakeHost& host) {
@@ -242,6 +247,64 @@ void testHitPointTracksLayout() {
     pulp_embed_destroy(v);
 }
 
+// ── a control nothing can hit reports no point, rather than a plausible one ───
+// Every case above asks for the point of a control that IS reachable. This one
+// asks for a control that is not: a disabled element is skipped by the view's
+// hit-tester, so NO point reaches it. The verb's contract is to say so — a
+// coordinate that misses is indistinguishable from a dead control, which is the
+// failure the verb exists to prevent.
+//
+// This is also the tripwire for which SDK the shim actually linked against. The
+// accessor only refuses here because it round-trips its candidate point through
+// the real hit-tester before promising it; an SDK build whose accessor merely
+// computes the anchor returns a point for a control nothing can reach, and this
+// test goes red. That makes a wrong-SDK link a loud failure rather than a suite
+// that passes while validating geometry the shipped SDK does not enforce.
+void testUnhittableControlReportsNoPoint() {
+    FakeHost host;
+    PulpEmbedDesc d = makeDesc(host);
+    PulpEmbedView* v = create(host, d);
+    if (!v) return;
+    if (!g_frame) {
+        check(false, "the design frame was captured");
+        pulp_embed_destroy(v);
+        return;
+    }
+
+    const int bypass = indexOfKey(v, "bypass");
+    double x = 0, y = 0;
+    check(pulp_embed_param_hit_point(v, bypass, &x, &y) == PULP_EMBED_OK,
+          "the toggle reports a hit point while enabled");
+
+    // Disable it: the hit-tester now skips it, so nothing can land on it.
+    g_frame->set_element_enabled(kTogIdx, false);
+
+    // Prove the premise before pinning the refusal — the point that DID hit the
+    // toggle must now reach nothing, or "no point exists" would be an assumption
+    // rather than a fact this fixture established.
+    host.begins.clear();
+    pulp_embed_dispatch_mouse_down(v, x, y);
+    pulp_embed_dispatch_mouse_up(v, x, y);
+    check(host.begins.empty(), "pressing a disabled control grabs nothing");
+
+    double rx = -7, ry = -9;
+    const PulpEmbedResult r = pulp_embed_param_hit_point(v, bypass, &rx, &ry);
+    check(r == PULP_EMBED_ERR_UNSUPPORTED, "a control nothing can hit reports no point");
+    if (r == PULP_EMBED_OK)
+        std::printf("     the SDK's element_hit_point answered (%.3f, %.3f) for a control"
+                    " nothing can hit: it is not proving the anchor against the"
+                    " hit-tester\n", rx, ry);
+    check(approx(rx, -7) && approx(ry, -9), "the refused call left the out-params untouched");
+
+    // Re-enabling restores the point: the refusal tracks live state rather than
+    // latching the control off after one miss.
+    g_frame->set_element_enabled(kTogIdx, true);
+    check(pulp_embed_param_hit_point(v, bypass, &rx, &ry) == PULP_EMBED_OK,
+          "re-enabling the control restores its hit point");
+
+    pulp_embed_destroy(v);
+}
+
 // ── bad addressing is refused, never answered with a plausible point ──────────
 void testInvalidArgs() {
     FakeHost host;
@@ -271,6 +334,7 @@ int main() {
     testHitPointLocatesEachControl();
     testDragFromHitPointMovesTheControl();
     testHitPointTracksLayout();
+    testUnhittableControlReportsNoPoint();
     testInvalidArgs();
     std::printf("%s\n", g_fail == 0 ? "hit-point test: all pass"
                                     : "hit-point test: FAILURES");

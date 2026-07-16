@@ -24,7 +24,7 @@ these adapter tags.
 
 | Surface | Shipped value | Notes |
 |---------|---------------|-------|
-| Pulp SDK | v0.550.0 | Latest published SDK release. Ships a `find_package`-able `pulp-sdk-<platform>.tar.gz` (e.g. `pulp-sdk-darwin-arm64.tar.gz`, carrying `lib/cmake/Pulp/PulpConfig.cmake` + `libpulp-*.a`). The shim is built against the Pulp SDK; a foreign host linking the prebuilt dylib never sees this version. |
+| Pulp SDK | **unreleased** (see the v10/v11 note below) | ABI v10 and v11 need SDK methods no published release carries — as of the latest published Pulp (v0.675.0), neither `HostParamSurface::param_step_count` nor `DesignFrameView::element_hit_point` ships. A published SDK builds this shim only up to **ABI v9**. The SDK ships a `find_package`-able `pulp-sdk-<platform>.tar.gz` (e.g. `pulp-sdk-darwin-arm64.tar.gz`, carrying `lib/cmake/Pulp/PulpConfig.cmake` + `libpulp-*.a`); the shim is built against it, and a foreign host linking the prebuilt dylib never sees this version. |
 | Embed ABI | v11 | `PULP_VIEW_EMBED_ABI_VERSION` in `include/pulp_view_embed.h`; the number `pulp_embed_abi_version()` reports. |
 | pulp-view-embed | v0.1.0 | This repo — the shim that provides embed ABI v11. |
 | pulp-embed-juce | v0.1.0 | JUCE host adapter. |
@@ -53,18 +53,29 @@ the documented bounds without breaking the seam.
 | v7 | 0.1.0 | Pulp ≥ 0.332.1 | juce v0.1 | missing-asset diagnostics |
 | v8 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (dynamic-UI) | `has_param` / `param_display_text` snapshot, `host_action`; `dispatch_mouse_down/_drag/_up` |
 | v9 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (idle-gate) | `pulp_embed_set_dirty_gate` — opt-in idle repaint gate (default OFF; uses `needs_continuous_frames` when the SDK exports it, else a frame-clock/layout fallback) |
-| v10 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (step-count) | `host_param_steps` callback + `pulp_embed_param_steps` snapshot — the host's discrete step count for a key (0 = continuous/unknown), so a discrete control's divisor comes from the PARAMETER rather than the number of options the design draws; `pulp_embed_param_key_generation` — monotonic key-set counter a host gates its re-enumeration on (the only signal for a view-driven re-key) |
-| v11 | 0.1.0 (this release) | Pulp with `DesignFrameView::element_hit_point` (see note) | juce (drive-by-value) | `pulp_embed_param_hit_point` — the root-view point at which a pointer event lands on a control, so a host can aim `dispatch_mouse_down/_drag/_up` at a key it can already enumerate and drive it through the real gesture path (hit-test included) rather than reaching past hit-testing |
+| v10 | 0.1.0 (this release) | Pulp with `HostParamSurface::param_step_count` — **unreleased** (see note) | juce (step-count) | `host_param_steps` callback + `pulp_embed_param_steps` snapshot — the host's discrete step count for a key (0 = continuous/unknown), so a discrete control's divisor comes from the PARAMETER rather than the number of options the design draws; `pulp_embed_param_key_generation` — monotonic key-set counter a host gates its re-enumeration on (the only signal for a view-driven re-key) |
+| v11 | 0.1.0 (this release) | Pulp with `DesignFrameView::element_hit_point` — **unreleased** (see note) | juce (drive-by-value) | `pulp_embed_param_hit_point` — the root-view point at which a pointer event lands on a control, so a host can aim `dispatch_mouse_down/_drag/_up` at a key it can already enumerate and drive it through the real gesture path (hit-test included) rather than reaching past hit-testing |
 
-> **v11 needs an SDK method no published SDK carries yet.** A control's hit
-> anchor, the panel crop origin, and the panel→view fit are all private to
-> `DesignFrameView`, so the shim cannot locate a control without
-> `DesignFrameView::element_hit_point` — added to the Pulp SDK alongside this ABI
-> version. Until an SDK release ships it, building the shim with v11 requires an
-> SDK built from a tree that has it. The method itself is additive and
-> layout-neutral (a non-virtual accessor, no new members), and it has been built
-> and tested against both 0.667.0 and 0.674.0 — so the SDK floor for v11 is
-> whichever release first ships it, not a specific version above.
+> **v10 and v11 need SDK methods that NO published release carries.** As of Pulp
+> **v0.675.0** — the latest published release — neither
+> `HostParamSurface::param_step_count` (v10) nor
+> `DesignFrameView::element_hit_point` (v11) exists in any shipped SDK. Both were
+> added to the Pulp SDK alongside these ABI versions and are still unreleased, so
+> **the SDK floor for v10 and v11 is an unreleased Pulp**, not a version number
+> that can be quoted here yet.
+>
+> Concretely: the shim cannot compile `do_param_step_count(...) override` against
+> an SDK whose `HostParamSurface` has no such virtual, and it cannot locate a
+> control without `element_hit_point` — a control's hit anchor, the panel crop
+> origin, and the panel→view fit are all private to `DesignFrameView`. Building
+> the shim at v10/v11 therefore requires an SDK built from a tree carrying them.
+> Both methods are additive and layout-neutral (a new virtual with a defaulted
+> "cannot answer" implementation; a non-virtual accessor, no new members).
+>
+> **Replace this note with the real floor once a release ships them** — quote the
+> first release that carries each method, and restore a version number to the
+> "Shim built vs SDK" column for both rows. Until then, no version range stated
+> here would be true, and an adapter cannot pin a published SDK for v10/v11.
 
 > The "Shim built vs SDK" column is the SDK the shim needs at **build time**; a
 > foreign host linking the prebuilt dylib never sees it. `pulp-package.json`'s

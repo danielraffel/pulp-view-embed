@@ -265,6 +265,13 @@ typedef int32_t (*PulpEmbedGetStringFn)(void* host_ctx, const char* key,
  * flow — and the callback MUST NOT block (it runs on the host UI thread inline
  * with the gesture).
  *
+ * Wiring this callback is also what OPTS IN an imported design's action buttons:
+ * an imported design has no author to route them, so the shim routes them here
+ * exactly when the slot is non-NULL. Leave it NULL and an imported action button
+ * stays inert, as it was before the slot existed. A hand-built native view is
+ * unaffected — its author chooses which of its buttons are host commands and
+ * sends them through the SDK's host-action surface itself.
+ *
  * has_param + param_display_text are host->view and are read through a per-tick
  * snapshot (see pulp_embed_param_has / pulp_embed_param_display_text); the shim
  * resolves them once per pulp_embed_tick so paint never re-enters the host. All
