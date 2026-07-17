@@ -13,6 +13,8 @@
 #ifndef PULP_VIEW_EMBED_PROCESSORS_HPP
 #define PULP_VIEW_EMBED_PROCESSORS_HPP
 
+#include "host_param_kinds.hpp"
+
 #include <pulp/format/processor.hpp>
 #include <pulp/state/store.hpp>
 #include <pulp/view/design_import.hpp>
@@ -66,29 +68,24 @@ public:
         return pulp::view::build_native_view_tree(ir_, ir_.asset_manifest, opts);
     }
 
-    // Faithful-vector binding keys for every value-bearing element, in the same
-    // index order make_faithful_svg_frame builds them into the DesignFrameView,
-    // so element index i here maps to DesignFrameView element i. Key is the
-    // source node id (the importer's "binding key"); falls back to a stable
-    // synthetic key when the source carried none. Knobs are continuous; dropdown/
-    // tab_group/stepper are normalized-index choice params (DesignFrameView's
-    // uniform element_value/set_element_value handle both). text_field is text,
-    // not a normalized param, so it's skipped (still in-view interactive).
+    // Faithful-vector binding keys for every element that carries a host
+    // parameter, in the same index order make_faithful_svg_frame builds them
+    // into the DesignFrameView, so element index i here maps to DesignFrameView
+    // element i. Which kinds those are is host_param_kind()'s answer, shared with
+    // the native lane. Key is the source node id (the importer's "binding key");
+    // falls back to a stable synthetic "<kind>:<element index>" when the source
+    // carried none. The skipped kinds stay in-view and interactive — they are
+    // simply not host parameters.
     std::vector<std::pair<int, std::string>> faithful_element_keys() const {
         std::vector<std::pair<int, std::string>> out;
         const pulp::view::IRNode* frame = find_faithful_node(ir_.root);
         if (!frame) return out;
-        using K = pulp::view::InteractiveElementKind;
         for (int i = 0; i < static_cast<int>(frame->interactive_elements.size()); ++i) {
             const auto& e = frame->interactive_elements[static_cast<size_t>(i)];
-            if (e.kind == K::text_field) continue;  // text is not a normalized param
+            const HostParamKind hk = host_param_kind(e.kind);
+            if (!hk.name) continue;  // carries no host parameter
             std::string key = e.source_node_id.value_or("");
-            if (key.empty()) {
-                const char* p = e.kind == K::knob ? "knob"
-                              : e.kind == K::dropdown ? "dropdown"
-                              : e.kind == K::tab_group ? "tabs" : "stepper";
-                key = std::string(p) + ":" + std::to_string(i);
-            }
+            if (key.empty()) key = std::string(hk.name) + ":" + std::to_string(i);
             out.emplace_back(i, std::move(key));
         }
         return out;
@@ -129,19 +126,16 @@ public:
         std::vector<FaithfulMeta> out;
         const pulp::view::IRNode* frame = find_faithful_node(ir_.root);
         if (!frame) return out;
-        using K = pulp::view::InteractiveElementKind;
         for (int i = 0; i < static_cast<int>(frame->interactive_elements.size()); ++i) {
             const auto& e = frame->interactive_elements[static_cast<size_t>(i)];
-            if (e.kind == K::text_field) continue;  // skipped in keys() too
+            // The same table faithful_element_keys() asks, so the two vectors
+            // stay index-aligned by construction rather than by coincidence.
+            const HostParamKind hk = host_param_kind(e.kind);
+            if (!hk.name) continue;
             FaithfulMeta m;
             m.element_index = i;
-            switch (e.kind) {
-                case K::knob:      m.kind = "knob";      m.is_discrete = false; break;
-                case K::dropdown:  m.kind = "dropdown";  m.is_discrete = true;  break;
-                case K::tab_group: m.kind = "tab_group"; m.is_discrete = true;  break;
-                case K::stepper:   m.kind = "stepper";   m.is_discrete = true;  break;
-                default:           m.kind = "knob";      m.is_discrete = false; break;
-            }
+            m.kind = hk.name;
+            m.is_discrete = hk.discrete;
             if (m.is_discrete) {
                 m.option_count = static_cast<int>(e.options.size());
                 const int span = m.option_count > 1 ? m.option_count - 1 : 1;

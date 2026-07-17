@@ -515,10 +515,17 @@ struct ImportedDesign {
     }
 };
 
-// Build a minimal faithful design: a full-bleed panel carrying one bindable knob
-// and one action button. The SVG's intrinsic size matches the view's logical
-// size, so the panel transform is identity and the action rect below is also the
-// view-space rect a click must land on.
+// Build a faithful design carrying one of every kind that matters to the host
+// parameter surface: two that bind (a knob and a choice control) and, between
+// them, every kind that must NOT (an action and a swap button, a value_label
+// readout, an unregistered custom control, a text_field). The non-binding kinds
+// sit at element indices 1..5 on purpose — a lane that binds any of them both
+// invents a parameter and pushes the stepper's index down, so the enumeration
+// test below can catch either failure.
+//
+// The SVG's intrinsic size matches the view's logical size, so the panel
+// transform is identity and the action rect below is also the view-space rect a
+// click must land on. No element's rect overlaps another's.
 bool makeImportedDesign(ImportedDesign& out) {
     std::error_code ec;
     const auto base = std::filesystem::temp_directory_path(ec);
@@ -548,7 +555,18 @@ bool makeImportedDesign(ImportedDesign& out) {
             "svg_patch_d": "M60 40L60 32", "default_value": 0.5,
             "label": "Gain", "param_key": "gain" },
           { "kind": "action", "x": 100, "y": 4, "w": 40, "h": 20,
-            "action": "load_preset", "label": "Load" }
+            "action": "load_preset", "label": "Load" },
+          { "kind": "swap", "x": 150, "y": 4, "w": 30, "h": 20,
+            "target_frame": "page2", "label": "Next" },
+          { "kind": "value_label", "x": 190, "y": 4, "w": 40, "h": 20,
+            "text": "0.0 dB", "label": "Readout" },
+          { "kind": "custom", "x": 190, "y": 40, "w": 40, "h": 20,
+            "factory_id": "unregistered.control", "label": "Custom" },
+          { "kind": "text_field", "x": 4, "y": 60, "w": 60, "h": 16,
+            "placeholder": "name", "label": "Name" },
+          { "kind": "stepper", "x": 70, "y": 60, "w": 60, "h": 16,
+            "options": ["saw", "square", "sine"], "selected_index": 1,
+            "label": "Shape" }
         ],
         "children": []
       },
@@ -595,8 +613,8 @@ void testImportedDesignActionReachesHost() {
     // Prove the design materialized before reading anything into the click below:
     // a fixture that silently lost its elements would otherwise make the routing
     // assertion pass or fail for the wrong reason. The knob's binding is the
-    // signal — this pins the element the fixture depends on, deliberately not the
-    // total count, which also carries the non-value kinds.
+    // signal; what the whole design enumerates is pinned separately, by
+    // testImportedDesignBindsOnlyValueKinds.
     bool bound = false;
     for (int32_t i = 0; i < pulp_embed_param_count(v); ++i)
         if (paramKey(v, i) == "knob:0") bound = true;
@@ -607,6 +625,74 @@ void testImportedDesignActionReachesHost() {
     check(host.actions.size() == 1, "an imported design's action button reaches host_action");
     if (host.actions.size() == 1)
         check(host.actions[0].first == "load_preset", "the imported action carried its id");
+
+    pulp_embed_destroy(v);
+}
+
+// ── an imported design binds its value controls and nothing else ─────────────
+// The host parameter surface must carry exactly the controls that HAVE a value:
+// the knob and the stepper. A button, a readout, or a text field has none — the
+// view reports the "no normalized value" sentinel for them — so binding one
+// publishes a parameter that can never be read or written, and pushes every real
+// parameter behind it down an index.
+//
+// This pins the count and the whole enumeration, not just a member: an extra
+// phantom is exactly the kind of defect a "is my knob in there?" check passes.
+void testImportedDesignBindsOnlyValueKinds() {
+    ImportedDesign design;
+    if (!makeImportedDesign(design)) {
+        check(false, "the imported-design fixture was written (enumeration case)");
+        return;
+    }
+
+    FakeHost host;
+    PulpEmbedDesc d = makeDesc(host);
+    const std::string base = design.dir.string();
+    d.asset_base_path = base.c_str();
+    PulpEmbedView* v = nullptr;
+    if (pulp_embed_create_from_design_json_str(&d, design.json.data(), design.json.size(),
+                                               &v) != PULP_EMBED_OK || !v) {
+        check(false, "create_from_design_json_str (enumeration fixture)");
+        return;
+    }
+
+    // Two of the design's seven elements carry a value. The other five —
+    // action, swap, value_label, custom, text_field — do not.
+    check(pulp_embed_param_count(v) == 2,
+          "an imported design binds only its value controls");
+    if (pulp_embed_param_count(v) != 2) {
+        std::printf("     bound %d params:\n", pulp_embed_param_count(v));
+        for (int32_t i = 0; i < pulp_embed_param_count(v); ++i)
+            std::printf("       [%d] %s\n", i, paramKey(v, i).c_str());
+    }
+
+    // The keys AND their order: the stepper is element 6 in the design, and it
+    // must land at parameter index 1 — directly behind the knob, with none of the
+    // non-value kinds taking a slot in between.
+    check(paramKey(v, 0) == "knob:0", "the knob binds at index 0");
+    check(paramKey(v, 1) == "stepper:6",
+          "the stepper binds at index 1, behind the knob and nothing else");
+
+    // Each reports its own kind. The metadata used to come from a catch-all that
+    // called everything a continuous knob, which is how the non-value kinds got
+    // in: a choice control that reports itself continuous cannot be scaled.
+    PulpEmbedParamInfo knob{};
+    PulpEmbedParamInfo step{};
+    if (pulp_embed_param_info(v, 0, &knob) == PULP_EMBED_OK) {
+        check(std::string(knob.widget_kind) == "knob", "the knob reports widget_kind knob");
+        check(knob.is_discrete == 0, "the knob reports continuous");
+    } else {
+        check(false, "param_info for the knob");
+    }
+    if (pulp_embed_param_info(v, 1, &step) == PULP_EMBED_OK) {
+        check(std::string(step.widget_kind) == "stepper", "the stepper reports widget_kind stepper");
+        check(step.is_discrete == 1, "the stepper reports discrete");
+        check(step.option_count == 3, "the stepper reports its three options");
+        // selected_index 1 over a 3-option span -> 1/2.
+        check(approx(step.default_norm, 0.5), "the stepper's default is its imported selection");
+    } else {
+        check(false, "param_info for the stepper");
+    }
 
     pulp_embed_destroy(v);
 }
@@ -817,6 +903,7 @@ int main() {
     testDisplayTextNeverServesAnotherValuesText();
     testImportedDesignActionReachesHost();
     testImportedDesignActionWithoutHostCallback();
+    testImportedDesignBindsOnlyValueKinds();
     testStepCount();
     testNegativeStepsClamp();
     testPreviousAbiStructSizeGating();

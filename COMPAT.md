@@ -54,7 +54,7 @@ the documented bounds without breaking the seam.
 | v8 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (dynamic-UI) | `has_param` / `param_display_text` snapshot, `host_action`; `dispatch_mouse_down/_drag/_up` |
 | v9 | 0.1.0 (this release) | Pulp ≥ 0.550.0 | juce (idle-gate) | `pulp_embed_set_dirty_gate` — opt-in idle repaint gate (default OFF; uses `needs_continuous_frames` when the SDK exports it, else a frame-clock/layout fallback) |
 | v10 | 0.1.0 (this release) | Pulp with `HostParamSurface::param_step_count` — **unreleased** (see note) | juce (step-count) | `host_param_steps` callback + `pulp_embed_param_steps` snapshot — the host's discrete step count for a key (0 = continuous/unknown), so a discrete control's divisor comes from the PARAMETER rather than the number of options the design draws; `pulp_embed_param_key_generation` — monotonic key-set counter a host gates its re-enumeration on (the only signal for a view-driven re-key) |
-| v11 | 0.1.0 (this release) | Pulp with `DesignFrameView::element_hit_point` — **unreleased** (see note) | juce (drive-by-value) | `pulp_embed_param_hit_point` — the root-view point at which a pointer event lands on a control, so a host can aim `dispatch_mouse_down/_drag/_up` at a key it can already enumerate and drive it through the real gesture path (hit-test included) rather than reaching past hit-testing |
+| v11 | 0.1.0 (this release) | Pulp with `DesignFrameView::element_hit_point` — **unreleased** (see note) | juce (drive-by-value) | `pulp_embed_param_hit_point` — the root-view point at which a pointer event lands on a control, so a host can aim `dispatch_mouse_down/_drag/_up` at a key it can already enumerate and drive it through the real gesture path (hit-test included) rather than reaching past hit-testing. **Also corrects which controls an imported design enumerates as parameters — see [Parameter enumeration changed in v11](#parameter-enumeration-changed-in-v11).** |
 
 > **v10 and v11 need SDK methods that NO published release carries.** As of Pulp
 > **v0.675.0** — the latest published release — neither
@@ -82,6 +82,58 @@ the documented bounds without breaking the seam.
 > `verification.pulp_commit` is authoritative for the last-verified pairing.
 > ABI v4 (in-place `reload_bundle`) shipped as a function-only addition and is
 > folded into the same 0.1.0 line.
+
+## Parameter enumeration changed in v11
+
+**What a design enumerates as host parameters is narrower in v11 than in v10.**
+This is a behavior change inside one ABI version, landed with v11 rather than
+after it so the seam breaks once instead of twice. There is no v12 for it.
+
+A control is a host parameter only if it carries a **normalized value that
+persists between interactions**. Both binding lanes — an imported design
+(`create_from_design_json*`) and a host-supplied compiled view
+(`create_from_view`) — now answer that question from one shared table, so they
+cannot disagree about what a design binds.
+
+| Control kind | Binds a host parameter? | Why |
+|---|---|---|
+| `knob`, `fader`, `toggle`, `xy_pad` | **yes** (continuous) | a value in 0..1 |
+| `dropdown`, `tab_group`, `stepper` | **yes** (discrete) | a selection, reported as a normalized index |
+| `text_field` | no | a string — use the text-field bridge (ABI v6) |
+| `value_label` | no | a read-only readout |
+| `swap`, `action` | no | command buttons: a click fires a page swap or a host action, and carries nothing between clicks |
+| `momentary` | no | a press pulse, not a persisted value |
+| `custom` | no | a registered native control; the design declares no value domain for it |
+
+**What actually changed.** The `create_from_view` lane already bound this exact
+set. The imported-design lane did not: it excluded only `text_field` and let
+every other non-value kind fall through a catch-all into a continuous knob. So an
+imported design containing a button published a parameter per button that could
+never be read or written — `element_value` reports its "no normalized value"
+sentinel for those kinds.
+
+**Two consequences for a host that consumed v10:**
+
+- **Indices shift.** Every removed phantom pulls the real parameters behind it
+  down an index. A design with a knob at element 0 and a button at element 1
+  enumerated 2 parameters in v10 and enumerates 1 in v11; a real control that sat
+  at index 5 may now sit at index 1. **A host caching parameter indices across an
+  SDK bump must re-enumerate.** Re-enumerate by key (`pulp_embed_param_key`) and
+  gate on `pulp_embed_param_key_generation` (v10) — a cached index is not stable
+  across this change, and keys are what survive it.
+- **`param_info.widget_kind` is now each control's own kind.** In v10 the same
+  catch-all reported `fader`, `toggle`, and `xy_pad` as `"knob"` and continuous.
+  A host that switched on `widget_kind` will now see `"fader"`, `"toggle"`, and
+  `"xy_pad"`, and must handle them.
+
+**Synthetic keys.** A control whose design carried no source node id gets a
+generated `"<kind>:<element index>"` key. Two notes: the index is the element's
+position in the design, so it does **not** renumber when a non-value kind stops
+binding (a stepper at element 6 keeps `stepper:6` and simply moves to a lower
+parameter index); and an unnamed `tab_group` is now keyed `tab_group:<i>` rather
+than the previous `tabs:<i>`, so its prefix matches its reported `widget_kind`.
+A control whose design carries a source node id is keyed by that id and is
+unaffected.
 
 ## Version skew — the one rule an adapter must follow
 

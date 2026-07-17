@@ -63,6 +63,10 @@ thread_local std::string g_create_error;
 using pulp::embed::shim::EmbedNativeViewProcessor;
 using pulp::embed::shim::EmbedProcessor;
 using pulp::embed::shim::EmbedScriptedProcessor;
+// The shared answer to "does this control kind carry a host parameter?"
+// (host_param_kinds.hpp) — the native lane below asks it over a live view's
+// element kinds, the imported lane over the DesignIR's.
+using pulp::embed::shim::host_param_kind;
 
 // ── Parameter bridge ──────────────────────────────────────────────────────
 //
@@ -921,32 +925,21 @@ void build_param_bridge(PulpEmbedView* v) {
     // Native-view lane: a hand-built DesignFrameView (mounted via
     // pulp_embed_create_from_view) carries no DesignIR, so keys come off the LIVE
     // view — element_param_key(i) is the host param id the author declared. Bind
-    // every value-bearing element with a non-empty key; everything downstream
-    // (store param alloc, on_element_changed/gesture wiring, host->UI push) is
-    // shared with the faithful lane via frame_element_index. Discreteness metadata
-    // is reported coarsely (continuous) since the live view exposes no option
-    // count; the bind itself is correct for choice controls because
+    // every element with a non-empty key whose kind carries a host parameter
+    // (host_param_kind — the same table the imported lane asks); everything
+    // downstream (store param alloc, on_element_changed/gesture wiring, host->UI
+    // push) is shared with the faithful lane via frame_element_index.
+    // Discreteness metadata is reported coarsely (continuous) since the live view
+    // exposes no option count, so this lane deliberately does not claim the
+    // table's `discrete`; the bind itself is correct for choice controls because
     // element_value/set_element_value map the selection internally.
     if (dynamic_cast<EmbedNativeViewProcessor*>(v->processor.get())) {
         if (auto* frame = find_design_frame_view(root)) {
-            using Kind = pulp::view::DesignFrameElement::Kind;
             for (int i = 0; i < frame->element_count(); ++i) {
                 const std::string& key = frame->element_param_key(i);
                 if (key.empty()) continue;
-                const Kind kind = frame->element_kind(i);
-                const char* wk = nullptr;
-                switch (kind) {
-                    case Kind::knob:      wk = "knob";      break;
-                    case Kind::fader:     wk = "fader";     break;
-                    case Kind::toggle:    wk = "toggle";    break;
-                    case Kind::dropdown:  wk = "dropdown";  break;
-                    case Kind::tab_group: wk = "tab_group"; break;
-                    case Kind::stepper:   wk = "stepper";   break;
-                    case Kind::xy_pad:    wk = "xy_pad";    break;
-                    // text_field is a string (not a normalized param); momentary /
-                    // swap / action / value_label / custom carry no host param.
-                    default: continue;
-                }
+                const char* wk = host_param_kind(frame->element_kind(i)).name;
+                if (!wk) continue;  // carries no host parameter
                 ParamBinding b;
                 b.key = key;
                 b.widget_id = key;
