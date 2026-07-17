@@ -235,6 +235,39 @@ if(UNIX AND NOT APPLE AND NOT ANDROID AND COMMAND pulp_link_fontconfig_after_ski
 endif()
 add_test(NAME embed-frame-gate COMMAND pulp-embed-frame-gate)
 
+# ── live-key / host-action / step-count tests ────────────────────────────────
+# Drives the real C ABI against a synthetic host over a native DesignFrameView:
+# a runtime re-key must carry BOTH directions (UI->host writes/gestures and
+# host->UI pushes) to the new key; the host-action channel must reach the C
+# callback; and the step-count callback must report per key and stay
+# struct_size-gated for a previous-ABI caller. Same headless link recipe as
+# pulp-embed-validate (which already creates a windowed view in ctest), so it
+# gates on every OS.
+add_executable(pulp-embed-param-key tools/param_key_test.cpp)
+target_link_libraries(pulp-embed-param-key PRIVATE pulp_view_embed)
+if(APPLE)
+    target_link_libraries(pulp-embed-param-key PRIVATE "-framework AppKit")
+endif()
+if(UNIX AND NOT APPLE AND NOT ANDROID AND COMMAND pulp_link_fontconfig_after_skia)
+    pulp_link_fontconfig_after_skia(pulp-embed-param-key)
+endif()
+add_test(NAME embed-param-key COMMAND pulp-embed-param-key)
+
+# ── control-geometry tests ───────────────────────────────────────────────────
+# pulp_embed_param_hit_point must report the point that actually LANDS on a named
+# control — proven by pressing it and asserting that control's gesture bracketed —
+# across a 1:1 fit, a uniform scale, and a letterboxed aspect. Same headless link
+# recipe as pulp-embed-param-key, so it gates on every OS.
+add_executable(pulp-embed-hit-point tools/hit_point_test.cpp)
+target_link_libraries(pulp-embed-hit-point PRIVATE pulp_view_embed)
+if(APPLE)
+    target_link_libraries(pulp-embed-hit-point PRIVATE "-framework AppKit")
+endif()
+if(UNIX AND NOT APPLE AND NOT ANDROID AND COMMAND pulp_link_fontconfig_after_skia)
+    pulp_link_fontconfig_after_skia(pulp-embed-hit-point)
+endif()
+add_test(NAME embed-hit-point COMMAND pulp-embed-hit-point)
+
 # Linux: live X11 host smoke — attach Pulp's child into a real X11 parent window
 # and capture the live back buffer (proves the X11PluginViewHost attach path, not
 # just the headless render). Needs an X server at runtime (run via xvfb-run); the

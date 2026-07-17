@@ -56,7 +56,48 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 9u
+#define PULP_VIEW_EMBED_ABI_VERSION 11u
+
+/* v11 (2026-07): control geometry. Adds pulp_embed_param_hit_point() — the
+ * root-view point at which a pointer event lands on a control. Additive
+ * function, no desc-layout change and no new host callback, so v1..v10 callers
+ * keep working unchanged.
+ *
+ * The mouse dispatchers take ROOT-VIEW coordinates, so a host that wants to
+ * drive a NAMED control through the real pointer path has to know where that
+ * control is. Nothing here exposed that: a control's hit anchor (a knob's pivot),
+ * the design's panel crop origin, and the panel->view fit are all private to the
+ * view, so the coordinate was underivable from outside and a host had no way to
+ * aim a click at a key it can already enumerate. Hosts were left with
+ * pulp_embed_simulate_param_drag(), which reaches PAST hit-testing and drives the
+ * widget directly — fine as a bridge-plumbing probe, but it cannot catch a
+ * regression in hit-testing or event routing, because it never runs them.
+ *
+ * With the point in hand a host composes the existing verbs — hit_point ->
+ * dispatch_mouse_down/drag/up -> pulp_embed_param_value — into a drive that runs
+ * the SAME code a user's mouse does, hit-test included, and can therefore fail
+ * the way production fails. */
+
+/* v10 (2026-07): host parameter step count. Appends ONE callback to the END of
+ * PulpEmbedHostCallbacks (after host_action), struct_size-gated exactly like the
+ * v3/v6/v8 tails, so a v1..v9 caller's smaller desc stops before it (read as
+ * NULL):
+ *   host_param_steps — the host's discrete step count for a key.
+ * A design cannot know a host parameter's discreteness: a radio with 3 VISIBLE
+ * options may be bound to a 6-step host parameter, and the normalized value a
+ * control emits must be derived from the PARAMETER's step count, not from the
+ * number of options the UI happens to draw. Only the host knows the real count,
+ * so it is asked. Consumed through the same per-tick SNAPSHOT as the v8 surface
+ * (pulp_embed_param_steps), so paint never calls back into the host. The
+ * host-block growth is struct_size-gated; the query function is additive, so
+ * v9 callers keep working unchanged.
+ *
+ * v10 also adds pulp_embed_param_key_generation() — a monotonic counter for the
+ * view's registration KEY SET, bumped on every runtime re-key and bridge
+ * rebuild. A re-key is driven from inside the view, so without this a host
+ * cannot know its key set moved; it is the cheap dirty gate a host->UI pump
+ * needs to avoid re-enumerating the ABI every tick. Additive function, no desc
+ * change. */
 
 /* v9 (2026-07): opt-in periodic-repaint dirty gate. Adds
  * pulp_embed_set_dirty_gate() so a host can tell pulp_embed_tick() to repaint
@@ -224,6 +265,13 @@ typedef int32_t (*PulpEmbedGetStringFn)(void* host_ctx, const char* key,
  * flow — and the callback MUST NOT block (it runs on the host UI thread inline
  * with the gesture).
  *
+ * Wiring this callback is also what OPTS IN an imported design's action buttons:
+ * an imported design has no author to route them, so the shim routes them here
+ * exactly when the slot is non-NULL. Leave it NULL and an imported action button
+ * stays inert, as it was before the slot existed. A hand-built native view is
+ * unaffected — its author chooses which of its buttons are host commands and
+ * sends them through the SDK's host-action surface itself.
+ *
  * has_param + param_display_text are host->view and are read through a per-tick
  * snapshot (see pulp_embed_param_has / pulp_embed_param_display_text); the shim
  * resolves them once per pulp_embed_tick so paint never re-enters the host. All
@@ -234,6 +282,23 @@ typedef size_t (*PulpEmbedParamDisplayTextFn)(void* host_ctx, const char* key,
                                               char* buf, size_t cap);
 typedef int    (*PulpEmbedHostActionFn)(void* host_ctx, const char* action,
                                         const char* args_json);
+
+/* Host parameter step count (ABI v10).
+ *
+ * The number of DISCRETE steps the host's parameter `key` has, or 0 for a
+ * continuous parameter / an unknown key — 0 means "continuous or unknown", and
+ * a caller must not distinguish the two.
+ *
+ * This is the divisor authority for a discrete control. The design's own option
+ * count is NOT it: a design may draw 3 radio options for a parameter the host
+ * defines with 6 steps, and the normalized value has to be derived from the
+ * host's count or the control addresses the wrong steps. The count is the number
+ * of steps, NOT a pre-computed divisor — a consumer derives the divisor from it
+ * under the host framework's own normalization convention.
+ *
+ * host->view, read through the per-tick snapshot (pulp_embed_param_steps), so
+ * paint never re-enters the host. Optional (NULL slot = every key reports 0). */
+typedef int32_t (*PulpEmbedHostParamStepsFn)(void* host_ctx, const char* key);
 
 typedef struct PulpEmbedHostCallbacks {
     PulpEmbedSetParamFn   set_param;     /* UI gesture -> host param write      */
@@ -251,6 +316,8 @@ typedef struct PulpEmbedHostCallbacks {
     PulpEmbedHasParamFn         has_param;          /* live membership (auth.)   */
     PulpEmbedParamDisplayTextFn param_display_text; /* formatted value string    */
     PulpEmbedHostActionFn       host_action;        /* opaque view->host command */
+    /* ABI v10 tail — struct_size-gated (v1..v9 callers stop before this). */
+    PulpEmbedHostParamStepsFn   host_param_steps;   /* discrete steps; 0 = cont. */
 } PulpEmbedHostCallbacks;
 
 /* Creation descriptor. Zero-initialize, then set struct_size = sizeof(*desc),
@@ -587,6 +654,36 @@ int32_t pulp_embed_param_has(PulpEmbedView* view, const char* key);
 size_t  pulp_embed_param_display_text(PulpEmbedView* view, int32_t index,
                                       char* buf, size_t cap);
 
+/* The host's discrete step count for `key`, as of the last snapshot (ABI v10).
+ * Reads the per-tick snapshot taken from host.host_param_steps — it never calls
+ * back into the host, so it is safe from a paint/layout path.
+ *
+ * Returns 0 for "continuous or unknown", which deliberately collapses every
+ * don't-know case: a continuous host parameter, a host that wires no
+ * host_param_steps callback, a key that is not a design control, and a NULL
+ * view. A caller must not distinguish them — 0 means "do not use a step
+ * divisor". A positive return is the host's authoritative step COUNT (not a
+ * divisor; derive the divisor from it). */
+int32_t pulp_embed_param_steps(PulpEmbedView* view, const char* key);
+
+/* Generation counter for the view's parameter KEY SET (ABI v10).
+ *
+ * Bumped whenever the set of registration keys can have changed: a runtime
+ * re-key (a paged/tabbed control re-pointing an element at another host
+ * parameter) and every param-bridge rebuild (creation, pulp_embed_reload_bundle).
+ * Monotonic for the life of the handle; 0 for a NULL view.
+ *
+ * This exists because a re-key is driven from INSIDE the view — a design's own
+ * chevron/tab click — so a host has no other way to learn its key set moved.
+ * Without it, a host->UI pump built at mount time keeps pushing the OLD keys and
+ * a re-keyed control silently stops tracking automation.
+ *
+ * Intended use is a dirty gate: cache this value, compare it once per tick, and
+ * re-enumerate pulp_embed_param_count/_key ONLY when it changes. That keeps the
+ * steady-state pump at a single integer compare instead of re-reading the whole
+ * key set every frame. */
+uint64_t pulp_embed_param_key_generation(PulpEmbedView* view);
+
 /* Host -> view: push a NORMALIZED [0,1] value for the parameter identified by
  * `key` (host automation, preset recall, get_param sync). Updates the embed's
  * StateStore, sets the matching widget's value, and repaints. Does NOT call
@@ -641,6 +738,31 @@ PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* view);
 PulpEmbedResult pulp_embed_dispatch_mouse_down(PulpEmbedView* view, double x, double y);
 PulpEmbedResult pulp_embed_dispatch_mouse_drag(PulpEmbedView* view, double x, double y);
 PulpEmbedResult pulp_embed_dispatch_mouse_up(PulpEmbedView* view, double x, double y);
+
+/* Where the control at `index` is (ABI v11): writes the ROOT-VIEW point — the
+ * same coordinate space the dispatchers above take — at which a pointer event
+ * lands on it. This is the missing half of the dispatch family: it turns a key a
+ * host can enumerate into a coordinate it can click.
+ *
+ * The point tracks the CURRENT layout (it is derived from the live panel fit), so
+ * re-read it after a resize rather than caching it. Writes nothing and returns
+ * PULP_EMBED_ERR_INVALID_ARG for a NULL view / NULL out-param / out-of-range
+ * index, and PULP_EMBED_ERR_UNSUPPORTED when this control has no locatable
+ * geometry — it is not on a design frame (a plain Knob/Fader/Toggle widget
+ * tree), or the view is not laid out yet. Never reports a plausible-looking
+ * fallback point: a wrong coordinate would silently miss the control and read as
+ * a dead control rather than a missing capability.
+ *
+ * Intended use is a value-driven drive that keeps the real gesture path:
+ *   pulp_embed_param_hit_point(v, i, &x, &y);
+ *   pulp_embed_dispatch_mouse_down(v, x, y);       // hit-tests + captures
+ *   pulp_embed_dispatch_mouse_drag(v, x, y - dy);  // MEASURE pulp_embed_param_value
+ *   ...                                            // iterate onto the target
+ *   pulp_embed_dispatch_mouse_up(v, x, y - dy);
+ * Prefer measuring the control's response over assuming its drag law: the law is
+ * the view's business and it differs per kind. */
+PulpEmbedResult pulp_embed_param_hit_point(PulpEmbedView* view, int32_t index,
+                                           double* out_x, double* out_y);
 
 /* ---- text-field string bridge (ABI v6) ------------------------------- *
  *

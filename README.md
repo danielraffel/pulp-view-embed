@@ -390,6 +390,70 @@ unconditional per-tick repaint — otherwise they'd stop updating while the edit
 is otherwise idle. The predicate is proven by `tools/frame_gate_test.cpp`
 (`ctest -R embed-frame-gate`).
 
+### Host step count + live keys (ABI v10)
+
+A design cannot know a host parameter's discreteness: a radio drawn with 3
+visible options may be bound to a 6-step parameter, and a control that derives
+its value from the number of options it draws addresses the wrong steps. The
+host is the authority, so it is asked — `host.host_param_steps(key)`, read back
+off the per-tick snapshot (never from paint):
+
+```c
+int32_t steps = pulp_embed_param_steps(view, "lfo_waveform");  /* 6 */
+/* 0 = CONTINUOUS or UNKNOWN — one answer, deliberately indistinguishable. It
+   also covers "no host_param_steps callback" and "not a design control", so
+   treat 0 as "do not use a step divisor". A positive value is a step COUNT, not
+   a divisor. */
+```
+
+A control can also be **re-keyed at run time** (`set_element_param_key` — a paged
+rack, a tabbed slot). That is driven from inside the view, so a host has no way
+to notice on its own; `pulp_embed_param_key_generation(view)` is the signal. It
+bumps on every re-key and every bridge rebuild, so a host gates its
+re-enumeration on an integer compare instead of re-reading the whole key set
+every tick:
+
+```c
+uint64_t gen = pulp_embed_param_key_generation(view);
+if (gen != cached_gen) { cached_gen = gen; /* re-enumerate param_count/_key */ }
+```
+
+Both are proven by `tools/param_key_test.cpp` (`ctest -R embed-param-key`),
+which also asserts that a re-key carries the UI→host writes/gestures and the
+host→UI pushes to the new key together.
+
+### Control geometry (ABI v11)
+
+`dispatch_mouse_down/_drag/_up` take root-view coordinates, so a host that wants
+to drive a control it can name had no way to aim them: a knob's hit anchor, the
+panel crop origin, and the panel→view fit are all private to the view.
+`pulp_embed_param_hit_point` closes that — it is the missing half of the dispatch
+family, turning an index into the point a pointer must land on.
+
+```c
+double x, y;
+if (pulp_embed_param_hit_point(view, index, &x, &y) == PULP_EMBED_OK) {
+    pulp_embed_dispatch_mouse_down(view, x, y);   /* hit-tests + captures */
+    pulp_embed_dispatch_mouse_drag(view, x, y - 20);
+    pulp_embed_dispatch_mouse_up(view, x, y - 20);
+}
+/* PULP_EMBED_ERR_UNSUPPORTED = this control has no locatable geometry (not on a
+   design frame, or not laid out yet). No fallback point is invented: a wrong
+   coordinate would miss and read as a dead control. Re-read after a resize —
+   the point tracks the live layout. */
+```
+
+This exists so a drive can keep the **real** gesture path. The older
+`pulp_embed_simulate_param_drag` reaches past hit-testing and drives the widget
+directly — useful as a bridge-plumbing probe, but it cannot catch a regression in
+hit-testing or event routing because it never runs them. Prefer composing
+`param_hit_point` + the dispatchers, and **measure** the control's response with
+`pulp_embed_param_value` rather than assuming its drag law (the law is per-kind
+and is the view's business). Proven by `tools/hit_point_test.cpp`
+(`ctest -R embed-hit-point`), which presses each reported point and asserts the
+named control — not a neighbour — took the gesture, at a 1:1 fit, a uniform
+scale, and a letterboxed aspect.
+
 ### Scoped out (this round)
 
 - **Zero-copy GPU compositing** (`IOSurface` / `MTLTexture` handle): deferred.
