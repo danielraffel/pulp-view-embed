@@ -1,6 +1,6 @@
 # pulp-view-embed
 
-A flat **C ABI** for embedding a [Pulp](https://github.com/danielraffel/pulp)-imported
+A flat **C ABI** for embedding a [Pulp](https://github.com/Generous-Corp/pulp)-imported
 frontend (e.g. a design imported from Figma) as a rendered child view inside a
 **foreign C++ host** — JUCE, iPlug2, or a bespoke shell — without the host
 linking Pulp's C++ ABI.
