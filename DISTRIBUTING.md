@@ -17,7 +17,7 @@ covered (the offscreen RGBA producer and the GPU host are macOS-only today).
 
 ## 1. Package manifest (`pulp-package.json`)
 
-`pulp-package.json` is a [Pulp registry v2](https://github.com/danielraffel/pulp/blob/main/tools/packages/registry-schema.json)-shaped
+`pulp-package.json` is a [Pulp registry v2](https://github.com/Generous-Corp/pulp/blob/main/tools/packages/registry-schema.json)-shaped
 package definition. It validates against the core registry schema, so it is
 drop-in for `pulp add` the moment the package is registered in Pulp's
 `tools/packages/registry.json`, and the FetchContent form it implies is usable
